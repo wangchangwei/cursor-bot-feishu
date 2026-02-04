@@ -43,6 +43,10 @@ if (config.ripgrepPath) {
 const processedMessages = new Set();
 const MESSAGE_CACHE_TTL = 5 * 60 * 1000; // 缓存 5 分钟
 
+// ========== 活跃任务管理 ==========
+// 用于跟踪和管理当前正在执行的任务，支持 stop 命令
+const activeTasks = new Map(); // chatId -> { child, prompt, startTime }
+
 function isMessageProcessed(messageId) {
   if (processedMessages.has(messageId)) {
     console.log(`[去重] 消息已处理过，跳过: ${messageId}`);
@@ -66,7 +70,7 @@ const client = new lark.Client({
 });
 
 // ========== 调用 Cursor CLI ==========
-async function callCursorCLI(prompt, mode = 'agent') {
+async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
   console.log(`[Cursor CLI] 执行任务: ${prompt.substring(0, 50)}...`);
   console.log(`[Cursor CLI] 模式: ${mode}`);
   console.log(`[Cursor CLI] 工作目录: ${config.workDir}`);
@@ -89,8 +93,25 @@ async function callCursorCLI(prompt, mode = 'agent') {
       stdio: ['pipe', 'pipe', 'pipe']
     });
     
+    // 注册活跃任务（用于 stop 命令）
+    if (chatId) {
+      activeTasks.set(chatId, {
+        child,
+        prompt: prompt.substring(0, 50),
+        startTime: Date.now(),
+      });
+    }
+    
+    // 清理任务的辅助函数
+    const cleanupTask = () => {
+      if (chatId) {
+        activeTasks.delete(chatId);
+      }
+    };
+    
     let result = '';
     let lastAssistantMessage = '';
+    let wasKilled = false;
     
     child.stdout.on('data', (data) => {
       const text = data.toString();
@@ -124,6 +145,13 @@ async function callCursorCLI(prompt, mode = 'agent') {
     
     child.on('close', (code) => {
       console.log(`[Cursor CLI] 退出码: ${code}`);
+      cleanupTask();
+      
+      // 如果是被用户手动终止的
+      if (wasKilled) {
+        reject(new Error('STOPPED_BY_USER'));
+        return;
+      }
       
       // 优先使用 result，否则使用最后的助手消息
       const finalResult = result || lastAssistantMessage;
@@ -139,8 +167,14 @@ async function callCursorCLI(prompt, mode = 'agent') {
     
     child.on('error', (err) => {
       console.log(`[Cursor CLI] 错误: ${err.message}`);
+      cleanupTask();
       reject(err);
     });
+    
+    // 标记进程可被外部终止
+    child.markAsKilled = () => {
+      wasKilled = true;
+    };
     
     // 通过 stdin 发送纯文本提示词
     child.stdin.write(prompt);
@@ -150,10 +184,33 @@ async function callCursorCLI(prompt, mode = 'agent') {
     setTimeout(() => {
       if (!child.killed) {
         child.kill();
+        cleanupTask();
         reject(new Error('命令执行超时（5分钟）'));
       }
     }, config.timeout);
   });
+}
+
+// ========== 停止当前任务 ==========
+function stopTask(chatId) {
+  const task = activeTasks.get(chatId);
+  if (task) {
+    console.log(`[Stop] 终止任务: ${task.prompt}...`);
+    task.child.markAsKilled?.();
+    task.child.kill('SIGTERM');
+    
+    // 如果 SIGTERM 不起作用，强制 SIGKILL
+    setTimeout(() => {
+      if (!task.child.killed) {
+        task.child.kill('SIGKILL');
+      }
+    }, 1000);
+    
+    activeTasks.delete(chatId);
+    const duration = Math.round((Date.now() - task.startTime) / 1000);
+    return { stopped: true, prompt: task.prompt, duration };
+  }
+  return { stopped: false };
 }
 
 // ========== 解析用户消息 ==========
@@ -228,22 +285,50 @@ async function handleMessage(event) {
   
   console.log(`[收到消息] ${text} (ID: ${messageId})`);
   
-  // 帮助命令
-  if (text.includes('/help') || text.includes('帮助')) {
+  // Stop 命令 - 终止当前任务
+  if (text.includes('/stop') || text === '停止' || text === '终止') {
+    const result = stopTask(chatId);
+    if (result.stopped) {
+      await sendMessage(chatId, `⏹️ 已终止任务\n\n任务：${result.prompt}...\n运行时长：${result.duration} 秒`);
+    } else {
+      await sendMessage(chatId, '当前没有正在执行的任务');
+    }
+    return;
+  }
+  
+  // Help 命令 - 帮助信息
+  if (text.includes('/help') || text === '帮助') {
     const helpText = `🤖 Cursor AI 助手使用说明
 
-📝 直接发送消息：AI 将执行代码任务
-   例：帮我写一个 Python 计算器
+━━━━━━━━━━━━━━━━━━━━━━
+📝 执行模式（默认）
+━━━━━━━━━━━━━━━━━━━━━━
+直接发送消息，AI 将执行代码任务
+例：帮我写一个 Python 计算器
 
-❓ 问答模式（只读）：
-   /ask 你的问题
-   或：问：你的问题
+━━━━━━━━━━━━━━━━━━━━━━
+❓ 问答模式（只读）
+━━━━━━━━━━━━━━━━━━━━━━
+/ask 你的问题
+或：问：你的问题
 
-📋 规划模式：
-   /plan 你的任务
-   或：规划：你的任务
+━━━━━━━━━━━━━━━━━━━━━━
+📋 规划模式
+━━━━━━━━━━━━━━━━━━━━━━
+/plan 你的任务
+或：规划：你的任务
 
-⚙️ 当前工作目录：${config.workDir}`;
+━━━━━━━━━━━━━━━━━━━━━━
+🛠️ 控制命令
+━━━━━━━━━━━━━━━━━━━━━━
+/stop - 终止当前正在执行的任务
+/help - 显示此帮助信息
+
+━━━━━━━━━━━━━━━━━━━━━━
+⚙️ 当前配置
+━━━━━━━━━━━━━━━━━━━━━━
+工作目录：${config.workDir}
+超时时间：${config.timeout / 1000} 秒`;
     
     await sendMessage(chatId, helpText);
     return;
@@ -266,13 +351,19 @@ async function handleMessage(event) {
   await sendMessage(chatId, `⏳ 正在${modeNames[mode]}中，请稍候...`);
   
   try {
-    // 调用 Cursor CLI
-    const result = await callCursorCLI(prompt, mode);
+    // 调用 Cursor CLI（传入 chatId 以支持 stop 命令）
+    const result = await callCursorCLI(prompt, mode, chatId);
     
     // 发送结果
     await sendMessage(chatId, `✅ ${modeNames[mode]}完成\n\n${result}`);
   } catch (error) {
     console.error('[错误]', error);
+    
+    // 如果是用户主动停止的，不显示错误
+    if (error.message === 'STOPPED_BY_USER') {
+      return;
+    }
+    
     await sendMessage(chatId, `❌ 执行出错：${error.message}`);
   }
 }
