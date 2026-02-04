@@ -45,6 +45,37 @@ if (config.ripgrepPath) {
 // 用于过滤历史消息，只处理服务启动后的消息
 const SERVICE_START_TIME = Date.now();
 
+// ========== 日志文件配置 ==========
+const LOG_FILE = path.join(config.workDir, 'cursor-bridge.log');
+
+// 重写 console.log 和 console.error，同时写入文件
+const originalLog = console.log;
+const originalError = console.error;
+
+function writeLog(level, ...args) {
+  const timestamp = new Date().toLocaleString();
+  const message = args.map(arg => 
+    typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
+  ).join(' ');
+  const logLine = `[${timestamp}] [${level}] ${message}\n`;
+  
+  try {
+    fs.appendFileSync(LOG_FILE, logLine);
+  } catch (e) {
+    // 忽略写入错误
+  }
+}
+
+console.log = (...args) => {
+  originalLog(...args);
+  writeLog('INFO', ...args);
+};
+
+console.error = (...args) => {
+  originalError(...args);
+  writeLog('ERROR', ...args);
+};
+
 // ========== 消息去重缓存 ==========
 // 用于防止飞书消息重试导致的重复处理
 const processedMessages = new Set();
@@ -196,6 +227,29 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
       }
     }, config.timeout);
   });
+}
+
+// ========== 读取日志文件 ==========
+function readLogFile(lines = 10) {
+  try {
+    if (!fs.existsSync(LOG_FILE)) {
+      return '日志文件不存在';
+    }
+    
+    const content = fs.readFileSync(LOG_FILE, 'utf-8');
+    const allLines = content.split('\n').filter(line => line.trim());
+    
+    // 获取最后 N 行
+    const lastLines = allLines.slice(-lines);
+    
+    if (lastLines.length === 0) {
+      return '日志为空';
+    }
+    
+    return `📋 最近 ${lastLines.length} 行日志：\n\n${lastLines.join('\n')}`;
+  } catch (error) {
+    return `读取日志失败：${error.message}`;
+  }
 }
 
 // ========== 停止当前任务 ==========
@@ -419,6 +473,7 @@ async function handleMessage(event) {
 ━━━━━━━━━━━━━━━━━━━━━━
 /stop - 终止当前正在执行的任务
 /screenshot - 截取屏幕并发送
+/log [行数] - 查看日志（默认10行）
 /help - 显示此帮助信息
 
 ━━━━━━━━━━━━━━━━━━━━━━
@@ -439,6 +494,24 @@ async function handleMessage(event) {
     } catch (error) {
       await sendMessage(chatId, `❌ 截图失败：${error.message}`);
     }
+    return;
+  }
+  
+  // Log 命令 - 查看日志
+  if (text.startsWith('/log') || text === '日志') {
+    // 解析行数参数，默认 10 行
+    let lines = 10;
+    const match = text.match(/\/log\s+(\d+)/);
+    if (match) {
+      lines = parseInt(match[1], 10);
+      // 限制最大行数，防止消息过长
+      if (lines > 200) {
+        lines = 200;
+      }
+    }
+    
+    const logContent = readLogFile(lines);
+    await sendMessage(chatId, logContent);
     return;
   }
   
