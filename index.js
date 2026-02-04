@@ -12,6 +12,7 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import http from 'http';
 import screenshot from 'screenshot-desktop';
 
 // ========== 配置 ==========
@@ -28,6 +29,9 @@ const config = {
   
   // ripgrep 路径（可选，如果已在系统 PATH 中则无需配置）
   ripgrepPath: process.env.RIPGREP_PATH || '',
+  
+  // 本地 API 服务端口（供 Cursor CLI 调用）
+  apiPort: parseInt(process.env.API_PORT) || 3456,
 };
 
 // 验证必要配置
@@ -84,6 +88,10 @@ const MESSAGE_CACHE_TTL = 5 * 60 * 1000; // 缓存 5 分钟
 // ========== 活跃任务管理 ==========
 // 用于跟踪和管理当前正在执行的任务，支持 stop 命令
 const activeTasks = new Map(); // chatId -> { child, prompt, startTime }
+
+// ========== 当前活跃的 chatId ==========
+// 用于 HTTP API 接口知道文件发送给哪个聊天
+let currentActiveChatId = null;
 
 // ========== 会话管理 ==========
 // 用于保持多轮对话的上下文
@@ -171,7 +179,7 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
   const conversationId = existingSession?.conversationId;
   
   // 构建命令参数
-  const args = ['-p', '--force', '--output-format', 'stream-json', '--stream-partial-output'];
+  const args = ['-p', '--force', '--output-format', 'stream-json', '--stream-partial-output', '--approve-mcps'];
   
   // 如果有现有会话，使用 --resume 参数继续对话
   if (conversationId) {
@@ -296,7 +304,7 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
       wasKilled = true;
     };
     
-    // 通过 stdin 发送纯文本提示词
+    // 通过 stdin 发送提示词
     child.stdin.write(prompt);
     child.stdin.end();
     
@@ -479,6 +487,250 @@ async function uploadImage(imagePath) {
   }
 }
 
+// ========== 上传文件到飞书 ==========
+async function uploadFile(filePath) {
+  try {
+    console.log(`[飞书] 上传文件: ${filePath}`);
+    
+    // 检查文件是否存在
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`文件不存在: ${filePath}`);
+    }
+    
+    const fileBuffer = fs.readFileSync(filePath);
+    const fileName = path.basename(filePath);
+    const fileStats = fs.statSync(filePath);
+    
+    // 根据文件扩展名确定文件类型
+    const ext = path.extname(filePath).toLowerCase();
+    let fileType = 'stream'; // 默认为二进制流
+    
+    // 飞书支持的文件类型: opus, mp4, pdf, doc, xls, ppt, stream
+    const typeMap = {
+      '.pdf': 'pdf',
+      '.doc': 'doc',
+      '.docx': 'doc',
+      '.xls': 'xls',
+      '.xlsx': 'xls',
+      '.ppt': 'ppt',
+      '.pptx': 'ppt',
+      '.mp4': 'mp4',
+      '.opus': 'opus',
+    };
+    
+    fileType = typeMap[ext] || 'stream';
+    
+    const response = await client.im.file.create({
+      data: {
+        file_type: fileType,
+        file_name: fileName,
+        file: fileBuffer,
+      },
+    });
+    
+    if (response.file_key) {
+      console.log(`[飞书] 文件上传成功: ${response.file_key}`);
+      return {
+        file_key: response.file_key,
+        file_name: fileName,
+        file_size: fileStats.size,
+      };
+    } else {
+      throw new Error('上传文件未返回 file_key');
+    }
+  } catch (error) {
+    console.error('[飞书] 文件上传失败:', error.message);
+    throw error;
+  }
+}
+
+// ========== 发送文件消息 ==========
+async function sendFile(chatId, fileKey, fileName) {
+  try {
+    await client.im.message.create({
+      params: {
+        receive_id_type: 'chat_id',
+      },
+      data: {
+        receive_id: chatId,
+        msg_type: 'file',
+        content: JSON.stringify({
+          file_key: fileKey,
+        }),
+      },
+    });
+    console.log(`[飞书] 文件消息发送成功: ${fileName}`);
+  } catch (error) {
+    console.error('[飞书] 文件消息发送失败:', error.message);
+    throw error;
+  }
+}
+
+// ========== 发送本地文件到飞书 ==========
+async function sendLocalFile(chatId, filePath) {
+  try {
+    // 处理相对路径
+    let absolutePath = filePath;
+    if (!path.isAbsolute(filePath)) {
+      absolutePath = path.join(config.workDir, filePath);
+    }
+    
+    console.log(`[文件] 准备发送文件: ${absolutePath}`);
+    
+    // 检查文件是否存在
+    if (!fs.existsSync(absolutePath)) {
+      throw new Error(`文件不存在: ${absolutePath}`);
+    }
+    
+    // 获取文件信息
+    const fileStats = fs.statSync(absolutePath);
+    const fileName = path.basename(absolutePath);
+    
+    // 检查文件大小（飞书限制 30MB）
+    const maxSize = 30 * 1024 * 1024; // 30MB
+    if (fileStats.size > maxSize) {
+      throw new Error(`文件过大（${(fileStats.size / 1024 / 1024).toFixed(2)}MB），飞书限制 30MB`);
+    }
+    
+    // 上传文件
+    const { file_key, file_size } = await uploadFile(absolutePath);
+    
+    // 发送文件消息
+    await sendFile(chatId, file_key, fileName);
+    
+    return {
+      success: true,
+      fileName,
+      fileSize: file_size,
+    };
+  } catch (error) {
+    console.error('[文件] 发送失败:', error.message);
+    throw error;
+  }
+}
+
+// ========== 列出工作目录下的文件 ==========
+function listFiles(dirPath = config.workDir, pattern = '') {
+  try {
+    const files = [];
+    const items = fs.readdirSync(dirPath, { withFileTypes: true });
+    
+    for (const item of items) {
+      // 跳过隐藏文件和 node_modules
+      if (item.name.startsWith('.') || item.name === 'node_modules') {
+        continue;
+      }
+      
+      const fullPath = path.join(dirPath, item.name);
+      const relativePath = path.relative(config.workDir, fullPath);
+      
+      if (item.isFile()) {
+        // 如果有 pattern，检查文件名是否匹配
+        if (!pattern || item.name.toLowerCase().includes(pattern.toLowerCase())) {
+          const stats = fs.statSync(fullPath);
+          files.push({
+            name: item.name,
+            path: relativePath,
+            size: stats.size,
+            mtime: stats.mtime,
+          });
+        }
+      } else if (item.isDirectory()) {
+        // 递归扫描子目录（限制深度为 3）
+        const depth = relativePath.split(path.sep).length;
+        if (depth < 3) {
+          files.push(...listFiles(fullPath, pattern));
+        }
+      }
+    }
+    
+    // 按修改时间倒序排列
+    files.sort((a, b) => b.mtime - a.mtime);
+    
+    return files;
+  } catch (error) {
+    console.error('[文件列表] 错误:', error.message);
+    return [];
+  }
+}
+
+// ========== 格式化文件大小 ==========
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+// ========== 获取目录下所有文件的快照 ==========
+function getFileSnapshot(dirPath = config.workDir) {
+  const snapshot = new Map();
+  
+  function scanDir(dir, depth = 0) {
+    if (depth > 3) return; // 限制递归深度
+    
+    try {
+      const items = fs.readdirSync(dir, { withFileTypes: true });
+      
+      for (const item of items) {
+        // 跳过隐藏文件和 node_modules
+        if (item.name.startsWith('.') || item.name === 'node_modules') {
+          continue;
+        }
+        
+        const fullPath = path.join(dir, item.name);
+        
+        if (item.isFile()) {
+          try {
+            const stats = fs.statSync(fullPath);
+            snapshot.set(fullPath, {
+              size: stats.size,
+              mtime: stats.mtimeMs,
+            });
+          } catch (e) {
+            // 忽略无法读取的文件
+          }
+        } else if (item.isDirectory()) {
+          scanDir(fullPath, depth + 1);
+        }
+      }
+    } catch (e) {
+      // 忽略无法读取的目录
+    }
+  }
+  
+  scanDir(dirPath);
+  return snapshot;
+}
+
+// ========== 比较文件快照，找出新建和修改的文件 ==========
+function compareSnapshots(before, after) {
+  const newFiles = [];
+  const modifiedFiles = [];
+  
+  for (const [filePath, afterInfo] of after.entries()) {
+    const beforeInfo = before.get(filePath);
+    const relativePath = path.relative(config.workDir, filePath);
+    
+    if (!beforeInfo) {
+      // 新文件
+      newFiles.push({
+        path: relativePath,
+        fullPath: filePath,
+        size: afterInfo.size,
+      });
+    } else if (afterInfo.mtime > beforeInfo.mtime || afterInfo.size !== beforeInfo.size) {
+      // 修改的文件
+      modifiedFiles.push({
+        path: relativePath,
+        fullPath: filePath,
+        size: afterInfo.size,
+      });
+    }
+  }
+  
+  return { newFiles, modifiedFiles };
+}
+
 // ========== 发送图片消息 ==========
 async function sendImage(chatId, imageKey) {
   try {
@@ -640,6 +892,13 @@ async function handleMessage(event) {
 /help - 显示此帮助信息
 
 ━━━━━━━━━━━━━━━━━━━━━━
+📂 文件操作
+━━━━━━━━━━━━━━━━━━━━━━
+/ls [关键词] - 列出工作目录文件
+/file <路径> - 发送指定文件到飞书
+例: /file src/index.js
+
+━━━━━━━━━━━━━━━━━━━━━━
 ⚙️ 当前配置
 ━━━━━━━━━━━━━━━━━━━━━━
 工作目录：${config.workDir}
@@ -678,6 +937,66 @@ async function handleMessage(event) {
     return;
   }
   
+  // File 命令 - 发送文件
+  if (text.startsWith('/file ') || text.startsWith('发送文件 ') || text.startsWith('发文件 ')) {
+    const filePath = text.replace(/^(\/file\s+|发送文件\s+|发文件\s+)/, '').trim();
+    
+    if (!filePath) {
+      await sendMessage(chatId, '请指定文件路径\n\n用法: /file <文件路径>\n例如: /file src/index.js\n\n提示: 使用 /ls 命令查看可用文件');
+      return;
+    }
+    
+    await sendMessage(chatId, `📤 正在发送文件: ${filePath}`);
+    
+    try {
+      const result = await sendLocalFile(chatId, filePath);
+      await sendMessage(chatId, `✅ 文件发送成功\n\n文件名: ${result.fileName}\n大小: ${formatFileSize(result.fileSize)}`);
+    } catch (error) {
+      await sendMessage(chatId, `❌ 文件发送失败: ${error.message}`);
+    }
+    return;
+  }
+  
+  // Ls 命令 - 列出文件
+  if (text.startsWith('/ls') || text === '文件列表' || text === '列出文件') {
+    // 解析搜索参数
+    const match = text.match(/^\/ls\s+(.+)/);
+    const pattern = match ? match[1].trim() : '';
+    
+    const files = listFiles(config.workDir, pattern);
+    
+    if (files.length === 0) {
+      await sendMessage(chatId, pattern 
+        ? `未找到匹配 "${pattern}" 的文件`
+        : '工作目录下没有文件');
+      return;
+    }
+    
+    // 只显示前 20 个文件
+    const displayFiles = files.slice(0, 20);
+    
+    let fileList = `📁 工作目录文件${pattern ? ` (搜索: ${pattern})` : ''}\n\n`;
+    fileList += displayFiles.map((f, i) => {
+      const sizeStr = formatFileSize(f.size);
+      const timeStr = new Date(f.mtime).toLocaleString('zh-CN', { 
+        month: '2-digit', 
+        day: '2-digit', 
+        hour: '2-digit', 
+        minute: '2-digit' 
+      });
+      return `${i + 1}. ${f.path}\n   ${sizeStr} | ${timeStr}`;
+    }).join('\n\n');
+    
+    if (files.length > 20) {
+      fileList += `\n\n... 还有 ${files.length - 20} 个文件`;
+    }
+    
+    fileList += '\n\n💡 使用 /file <路径> 发送文件';
+    
+    await sendMessage(chatId, fileList);
+    return;
+  }
+  
   // 解析消息
   const { mode, prompt } = parseMessage(text);
   
@@ -698,13 +1017,71 @@ async function handleMessage(event) {
   const sessionHint = existingSession ? '（继续对话）' : '（新会话）';
   await sendMessage(chatId, `⏳ 正在${modeNames[mode]}中${sessionHint}，请稍候...`);
   
+  // 设置当前活跃的 chatId（供 API 接口使用）
+  currentActiveChatId = chatId;
+  
+  // 执行前获取文件快照（用于检测新生成的文件）
+  const beforeSnapshot = getFileSnapshot();
+  
   try {
     // 调用 Cursor CLI（传入 chatId 以支持 stop 命令）
     const result = await callCursorCLI(prompt, mode, chatId);
     
+    // 执行后获取文件快照
+    const afterSnapshot = getFileSnapshot();
+    const { newFiles, modifiedFiles } = compareSnapshots(beforeSnapshot, afterSnapshot);
+    
     // 发送结果（使用 Markdown 卡片格式）
     const cardTitle = `✅ ${modeNames[mode]}完成`;
     await sendMarkdownCard(chatId, result, cardTitle);
+    
+    // 检查用户是否要求发送文件
+    const wantsSendFile = /发送|发给我|给我|发我|传给我|send|发到飞书/.test(prompt);
+    
+    // 如果有新建的文件
+    if (newFiles.length > 0) {
+      // 如果用户要求发送文件，自动发送新建的文件
+      if (wantsSendFile) {
+        await sendMessage(chatId, `📤 正在发送 ${newFiles.length} 个新文件...`);
+        
+        let successCount = 0;
+        let failedFiles = [];
+        
+        for (const file of newFiles.slice(0, 5)) { // 最多发送 5 个文件
+          try {
+            await sendLocalFile(chatId, file.fullPath);
+            successCount++;
+          } catch (error) {
+            failedFiles.push({ name: file.path, error: error.message });
+          }
+        }
+        
+        if (successCount > 0) {
+          let notice = `✅ 成功发送 ${successCount} 个文件`;
+          if (newFiles.length > 5) {
+            notice += `\n\n还有 ${newFiles.length - 5} 个文件未发送，使用 /ls 查看`;
+          }
+          if (failedFiles.length > 0) {
+            notice += `\n\n❌ ${failedFiles.length} 个文件发送失败`;
+          }
+          await sendMessage(chatId, notice);
+        } else if (failedFiles.length > 0) {
+          await sendMessage(chatId, `❌ 文件发送失败: ${failedFiles[0].error}`);
+        }
+      } else {
+        // 不需要发送，只提示有新文件
+        let fileNotice = '📂 **检测到新文件**\n\n';
+        newFiles.slice(0, 10).forEach(f => {
+          fileNotice += `• ${f.path} (${formatFileSize(f.size)})\n`;
+        });
+        if (newFiles.length > 10) {
+          fileNotice += `\n... 还有 ${newFiles.length - 10} 个文件\n`;
+        }
+        fileNotice += '\n💡 发送 `/file <路径>` 获取文件';
+        
+        await sendMarkdownCard(chatId, fileNotice, '📂 新文件');
+      }
+    }
   } catch (error) {
     console.error('[错误]', error);
     
@@ -715,6 +1092,101 @@ async function handleMessage(event) {
     
     await sendMessage(chatId, `❌ 执行出错：${error.message}`);
   }
+}
+
+// ========== HTTP API 服务器 ==========
+// 提供给 Cursor CLI 调用的文件发送接口
+function startApiServer() {
+  const server = http.createServer(async (req, res) => {
+    // 设置 CORS 头
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    // 处理 OPTIONS 预检请求
+    if (req.method === 'OPTIONS') {
+      res.writeHead(200);
+      res.end();
+      return;
+    }
+    
+    // 只处理 POST /send-file
+    if (req.method === 'POST' && req.url === '/send-file') {
+      let body = '';
+      
+      req.on('data', chunk => {
+        body += chunk.toString();
+      });
+      
+      req.on('end', async () => {
+        try {
+          const data = JSON.parse(body);
+          const filePath = data.file_path;
+          
+          if (!filePath) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: '缺少 file_path 参数' }));
+            return;
+          }
+          
+          if (!currentActiveChatId) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: '没有活跃的聊天会话' }));
+            return;
+          }
+          
+          console.log(`[API] 收到文件发送请求: ${filePath} -> ${currentActiveChatId}`);
+          
+          // 发送文件
+          const result = await sendLocalFile(currentActiveChatId, filePath);
+          
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ 
+            success: true, 
+            message: '文件发送成功',
+            fileName: result.fileName,
+            fileSize: result.fileSize,
+          }));
+          
+          console.log(`[API] 文件发送成功: ${result.fileName}`);
+        } catch (error) {
+          console.error(`[API] 文件发送失败:`, error.message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: error.message }));
+        }
+      });
+    } 
+    // 健康检查接口
+    else if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ 
+        status: 'ok', 
+        activeChatId: currentActiveChatId,
+        workDir: config.workDir,
+      }));
+    }
+    // 其他请求返回 404
+    else {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not Found' }));
+    }
+  });
+  
+  server.listen(config.apiPort, '127.0.0.1', () => {
+    console.log(`📡 API 服务已启动: http://localhost:${config.apiPort}`);
+    console.log(`   - POST /send-file - 发送文件到飞书`);
+    console.log(`   - GET /health - 健康检查`);
+  });
+  
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`❌ 端口 ${config.apiPort} 已被占用，请修改 API_PORT 环境变量`);
+    } else {
+      console.error(`❌ API 服务启动失败:`, err.message);
+    }
+  });
+  
+  return server;
 }
 
 // ========== 启动长连接 ==========
@@ -755,6 +1227,10 @@ async function startWebSocket() {
 }
 
 // ========== 主入口 ==========
+// 启动 API 服务器（供 Cursor CLI 调用）
+startApiServer();
+
+// 启动飞书 WebSocket 连接
 startWebSocket().catch((error) => {
   console.error('启动失败:', error);
   process.exit(1);
