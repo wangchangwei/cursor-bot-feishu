@@ -1,0 +1,16 @@
+{
+  "name": "feishu-cursor-bridge",
+  "version": "1.0.0",
+  "description": "飞书机器人 + Cursor CLI 桥接服务",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.72.1",
+    "@larksuiteoapi/node-sdk": "^1.36.1",
+    "dotenv": "^17.2.3"
+  }
+}

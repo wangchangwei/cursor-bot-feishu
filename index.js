@@ -1,0 +1,293 @@
+/**
+ * 飞书机器人 + Cursor CLI 桥接服务
+ * 
+ * 功能：接收飞书消息，调用 Cursor CLI 处理，返回结果
+ * 
+ * @author Cursor AI Assistant
+ * @version 1.0.0
+ */
+
+import 'dotenv/config';
+import * as lark from '@larksuiteoapi/node-sdk';
+import { spawn } from 'child_process';
+
+// ========== 配置 ==========
+const config = {
+  // 飞书应用凭证（从环境变量读取）
+  appId: process.env.FEISHU_APP_ID,
+  appSecret: process.env.FEISHU_APP_SECRET,
+  
+  // Cursor CLI 工作目录（可选，默认当前目录）
+  workDir: process.env.CURSOR_WORK_DIR || process.cwd(),
+  
+  // 命令超时时间（毫秒），默认 5 分钟
+  timeout: parseInt(process.env.CURSOR_TIMEOUT) || 300000,
+  
+  // ripgrep 路径（可选，如果已在系统 PATH 中则无需配置）
+  ripgrepPath: process.env.RIPGREP_PATH || '',
+};
+
+// 验证必要配置
+if (!config.appId || !config.appSecret) {
+  console.error('❌ 错误：请在 .env 文件中配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET');
+  process.exit(1);
+}
+
+// 如果配置了 ripgrep 路径，添加到 PATH
+if (config.ripgrepPath) {
+  process.env.PATH = `${config.ripgrepPath};${process.env.PATH}`;
+}
+
+// ========== 初始化飞书客户端 ==========
+const client = new lark.Client({
+  appId: config.appId,
+  appSecret: config.appSecret,
+  disableTokenCache: false,
+});
+
+// ========== 调用 Cursor CLI ==========
+async function callCursorCLI(prompt, mode = 'agent') {
+  console.log(`[Cursor CLI] 执行任务: ${prompt.substring(0, 50)}...`);
+  console.log(`[Cursor CLI] 模式: ${mode}`);
+  console.log(`[Cursor CLI] 工作目录: ${config.workDir}`);
+  
+  // 构建命令参数
+  const args = ['-p', '--force', '--output-format', 'stream-json', '--stream-partial-output'];
+  
+  console.log(`[Cursor CLI] 命令: agent ${args.join(' ')}`);
+  
+  // 清除可能导致问题的环境变量
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.CURSOR_CLI;
+  delete cleanEnv.CURSOR_AGENT;
+  
+  return new Promise((resolve, reject) => {
+    const child = spawn('agent', args, {
+      cwd: config.workDir,
+      env: cleanEnv,
+      shell: true,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    
+    let result = '';
+    let lastAssistantMessage = '';
+    
+    child.stdout.on('data', (data) => {
+      const text = data.toString();
+      console.log(`[Cursor CLI 输出] ${text.substring(0, 200)}`);
+      
+      // 解析每一行 JSON
+      const lines = text.split('\n').filter(line => line.trim());
+      for (const line of lines) {
+        try {
+          const json = JSON.parse(line);
+          
+          // 获取最终结果
+          if (json.type === 'result' && json.result) {
+            result = json.result;
+            console.log(`[Cursor CLI] 获取到结果: ${result.substring(0, 100)}...`);
+          }
+          
+          // 获取助手消息（备用）
+          if (json.type === 'assistant' && json.message?.content?.[0]?.text) {
+            lastAssistantMessage = json.message.content[0].text;
+          }
+        } catch (e) {
+          // 忽略非 JSON 行
+        }
+      }
+    });
+    
+    child.stderr.on('data', (data) => {
+      console.log(`[Cursor CLI 错误] ${data.toString()}`);
+    });
+    
+    child.on('close', (code) => {
+      console.log(`[Cursor CLI] 退出码: ${code}`);
+      
+      // 优先使用 result，否则使用最后的助手消息
+      const finalResult = result || lastAssistantMessage;
+      
+      if (finalResult) {
+        resolve(finalResult);
+      } else if (code === 0) {
+        resolve('任务完成');
+      } else {
+        reject(new Error(`命令退出码: ${code}`));
+      }
+    });
+    
+    child.on('error', (err) => {
+      console.log(`[Cursor CLI] 错误: ${err.message}`);
+      reject(err);
+    });
+    
+    // 通过 stdin 发送纯文本提示词
+    child.stdin.write(prompt);
+    child.stdin.end();
+    
+    // 超时处理
+    setTimeout(() => {
+      if (!child.killed) {
+        child.kill();
+        reject(new Error('命令执行超时（5分钟）'));
+      }
+    }, config.timeout);
+  });
+}
+
+// ========== 解析用户消息 ==========
+function parseMessage(text) {
+  // 移除 @ 机器人的部分
+  const cleanText = text.replace(/@[\w\u4e00-\u9fa5]+/g, '').trim();
+  
+  // 检测模式关键词
+  let mode = 'agent';
+  let prompt = cleanText;
+  
+  if (cleanText.startsWith('/ask ') || cleanText.startsWith('问：') || cleanText.startsWith('问:')) {
+    mode = 'ask';
+    prompt = cleanText.replace(/^(\/ask\s+|问[：:]\s*)/, '');
+  } else if (cleanText.startsWith('/plan ') || cleanText.startsWith('规划：') || cleanText.startsWith('规划:')) {
+    mode = 'plan';
+    prompt = cleanText.replace(/^(\/plan\s+|规划[：:]\s*)/, '');
+  }
+  
+  return { mode, prompt };
+}
+
+// ========== 发送飞书消息 ==========
+async function sendMessage(chatId, content, msgType = 'text') {
+  try {
+    // 截断过长的消息（飞书限制）
+    const maxLength = 30000;
+    let finalContent = content;
+    if (content.length > maxLength) {
+      finalContent = content.substring(0, maxLength) + '\n\n... (内容过长，已截断)';
+    }
+    
+    await client.im.message.create({
+      params: {
+        receive_id_type: 'chat_id',
+      },
+      data: {
+        receive_id: chatId,
+        msg_type: msgType,
+        content: JSON.stringify({
+          text: finalContent,
+        }),
+      },
+    });
+    console.log('[飞书] 消息发送成功');
+  } catch (error) {
+    console.error('[飞书] 消息发送失败:', error.message);
+  }
+}
+
+// ========== 处理消息事件 ==========
+async function handleMessage(event) {
+  const message = event.message;
+  const chatId = message.chat_id;
+  const msgType = message.message_type;
+  
+  // 只处理文本消息
+  if (msgType !== 'text') {
+    await sendMessage(chatId, '目前只支持文本消息哦~');
+    return;
+  }
+  
+  // 解析消息内容
+  const content = JSON.parse(message.content);
+  const text = content.text || '';
+  
+  console.log(`[收到消息] ${text}`);
+  
+  // 帮助命令
+  if (text.includes('/help') || text.includes('帮助')) {
+    const helpText = `🤖 Cursor AI 助手使用说明
+
+📝 直接发送消息：AI 将执行代码任务
+   例：帮我写一个 Python 计算器
+
+❓ 问答模式（只读）：
+   /ask 你的问题
+   或：问：你的问题
+
+📋 规划模式：
+   /plan 你的任务
+   或：规划：你的任务
+
+⚙️ 当前工作目录：${config.workDir}`;
+    
+    await sendMessage(chatId, helpText);
+    return;
+  }
+  
+  // 解析消息
+  const { mode, prompt } = parseMessage(text);
+  
+  if (!prompt) {
+    await sendMessage(chatId, '请输入您的问题或任务~');
+    return;
+  }
+  
+  // 发送处理中提示
+  const modeNames = {
+    agent: '执行',
+    ask: '查询',
+    plan: '规划',
+  };
+  await sendMessage(chatId, `⏳ 正在${modeNames[mode]}中，请稍候...`);
+  
+  try {
+    // 调用 Cursor CLI
+    const result = await callCursorCLI(prompt, mode);
+    
+    // 发送结果
+    await sendMessage(chatId, `✅ ${modeNames[mode]}完成\n\n${result}`);
+  } catch (error) {
+    console.error('[错误]', error);
+    await sendMessage(chatId, `❌ 执行出错：${error.message}`);
+  }
+}
+
+// ========== 启动长连接 ==========
+async function startWebSocket() {
+  console.log('========================================');
+  console.log('🚀 飞书 + Cursor CLI 桥接服务启动中...');
+  console.log('========================================');
+  console.log(`App ID: ${config.appId.substring(0, 8)}...`);
+  console.log(`工作目录: ${config.workDir}`);
+  console.log('');
+  
+  // 创建 WebSocket 客户端
+  const wsClient = new lark.WSClient({
+    appId: config.appId,
+    appSecret: config.appSecret,
+    loggerLevel: lark.LoggerLevel.info,
+  });
+  
+  // 注册消息事件处理器
+  wsClient.start({
+    eventDispatcher: new lark.EventDispatcher({}).register({
+      'im.message.receive_v1': async (data) => {
+        try {
+          await handleMessage(data);
+        } catch (error) {
+          console.error('[事件处理错误]', error);
+        }
+      },
+    }),
+  });
+  
+  console.log('✅ WebSocket 长连接已建立');
+  console.log('📱 现在可以在飞书中 @机器人 发送消息了');
+  console.log('');
+  console.log('按 Ctrl+C 停止服务');
+}
+
+// ========== 主入口 ==========
+startWebSocket().catch((error) => {
+  console.error('启动失败:', error);
+  process.exit(1);
+});
