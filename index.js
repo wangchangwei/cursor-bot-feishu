@@ -10,6 +10,9 @@
 import 'dotenv/config';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import screenshot from 'screenshot-desktop';
 
 // ========== 配置 ==========
 const config = {
@@ -265,6 +268,88 @@ async function sendMessage(chatId, content, msgType = 'text') {
   }
 }
 
+// ========== 上传图片到飞书 ==========
+async function uploadImage(imagePath) {
+  try {
+    console.log(`[飞书] 上传图片: ${imagePath}`);
+    
+    const imageBuffer = fs.readFileSync(imagePath);
+    
+    const response = await client.im.image.create({
+      data: {
+        image_type: 'message',
+        image: imageBuffer,
+      },
+    });
+    
+    if (response.image_key) {
+      console.log(`[飞书] 图片上传成功: ${response.image_key}`);
+      return response.image_key;
+    } else {
+      throw new Error('上传图片未返回 image_key');
+    }
+  } catch (error) {
+    console.error('[飞书] 图片上传失败:', error.message);
+    throw error;
+  }
+}
+
+// ========== 发送图片消息 ==========
+async function sendImage(chatId, imageKey) {
+  try {
+    await client.im.message.create({
+      params: {
+        receive_id_type: 'chat_id',
+      },
+      data: {
+        receive_id: chatId,
+        msg_type: 'image',
+        content: JSON.stringify({
+          image_key: imageKey,
+        }),
+      },
+    });
+    console.log('[飞书] 图片消息发送成功');
+  } catch (error) {
+    console.error('[飞书] 图片消息发送失败:', error.message);
+    throw error;
+  }
+}
+
+// ========== 截图并发送 ==========
+async function captureAndSendScreenshot(chatId) {
+  const tempPath = path.join(process.env.TEMP || '/tmp', `screenshot_${Date.now()}.png`);
+  
+  try {
+    console.log('[截图] 开始截取屏幕...');
+    
+    // 截取屏幕
+    await screenshot({ filename: tempPath, format: 'png' });
+    console.log(`[截图] 截图保存到: ${tempPath}`);
+    
+    // 上传图片
+    const imageKey = await uploadImage(tempPath);
+    
+    // 发送图片
+    await sendImage(chatId, imageKey);
+    
+    return true;
+  } catch (error) {
+    console.error('[截图] 失败:', error.message);
+    throw error;
+  } finally {
+    // 清理临时文件
+    try {
+      if (fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
+        console.log('[截图] 临时文件已清理');
+      }
+    } catch (e) {
+      // 忽略清理错误
+    }
+  }
+}
+
 // ========== 处理消息事件 ==========
 async function handleMessage(event) {
   const message = event.message;
@@ -333,6 +418,7 @@ async function handleMessage(event) {
 🛠️ 控制命令
 ━━━━━━━━━━━━━━━━━━━━━━
 /stop - 终止当前正在执行的任务
+/screenshot - 截取屏幕并发送
 /help - 显示此帮助信息
 
 ━━━━━━━━━━━━━━━━━━━━━━
@@ -342,6 +428,17 @@ async function handleMessage(event) {
 超时时间：${config.timeout / 1000} 秒`;
     
     await sendMessage(chatId, helpText);
+    return;
+  }
+  
+  // Screenshot 命令 - 截图并发送
+  if (text.includes('/screenshot') || text === '截图' || text === '截屏') {
+    await sendMessage(chatId, '📸 正在截取屏幕...');
+    try {
+      await captureAndSendScreenshot(chatId);
+    } catch (error) {
+      await sendMessage(chatId, `❌ 截图失败：${error.message}`);
+    }
     return;
   }
   
