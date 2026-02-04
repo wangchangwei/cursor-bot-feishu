@@ -38,6 +38,26 @@ if (config.ripgrepPath) {
   process.env.PATH = `${config.ripgrepPath};${process.env.PATH}`;
 }
 
+// ========== 消息去重缓存 ==========
+// 用于防止飞书消息重试导致的重复处理
+const processedMessages = new Set();
+const MESSAGE_CACHE_TTL = 5 * 60 * 1000; // 缓存 5 分钟
+
+function isMessageProcessed(messageId) {
+  if (processedMessages.has(messageId)) {
+    console.log(`[去重] 消息已处理过，跳过: ${messageId}`);
+    return true;
+  }
+  processedMessages.add(messageId);
+  
+  // 定时清理过期的消息 ID
+  setTimeout(() => {
+    processedMessages.delete(messageId);
+  }, MESSAGE_CACHE_TTL);
+  
+  return false;
+}
+
 // ========== 初始化飞书客户端 ==========
 const client = new lark.Client({
   appId: config.appId,
@@ -187,8 +207,14 @@ async function sendMessage(chatId, content, msgType = 'text') {
 // ========== 处理消息事件 ==========
 async function handleMessage(event) {
   const message = event.message;
+  const messageId = message.message_id;
   const chatId = message.chat_id;
   const msgType = message.message_type;
+  
+  // 消息去重：防止飞书重试机制导致重复处理
+  if (isMessageProcessed(messageId)) {
+    return;
+  }
   
   // 只处理文本消息
   if (msgType !== 'text') {
@@ -200,7 +226,7 @@ async function handleMessage(event) {
   const content = JSON.parse(message.content);
   const text = content.text || '';
   
-  console.log(`[收到消息] ${text}`);
+  console.log(`[收到消息] ${text} (ID: ${messageId})`);
   
   // 帮助命令
   if (text.includes('/help') || text.includes('帮助')) {
