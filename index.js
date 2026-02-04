@@ -38,6 +38,10 @@ if (config.ripgrepPath) {
   process.env.PATH = `${config.ripgrepPath};${process.env.PATH}`;
 }
 
+// ========== 服务启动时间 ==========
+// 用于过滤历史消息，只处理服务启动后的消息
+const SERVICE_START_TIME = Date.now();
+
 // ========== 消息去重缓存 ==========
 // 用于防止飞书消息重试导致的重复处理
 const processedMessages = new Set();
@@ -267,6 +271,13 @@ async function handleMessage(event) {
   const messageId = message.message_id;
   const chatId = message.chat_id;
   const msgType = message.message_type;
+  const createTime = parseInt(message.create_time); // 消息创建时间（毫秒时间戳）
+  
+  // 过滤历史消息：只处理服务启动后的消息
+  if (createTime < SERVICE_START_TIME) {
+    console.log(`[跳过] 历史消息，创建时间: ${new Date(createTime).toLocaleString()}, 服务启动: ${new Date(SERVICE_START_TIME).toLocaleString()}`);
+    return;
+  }
   
   // 消息去重：防止飞书重试机制导致重复处理
   if (isMessageProcessed(messageId)) {
@@ -375,6 +386,8 @@ async function startWebSocket() {
   console.log('========================================');
   console.log(`App ID: ${config.appId.substring(0, 8)}...`);
   console.log(`工作目录: ${config.workDir}`);
+  console.log(`启动时间: ${new Date(SERVICE_START_TIME).toLocaleString()}`);
+  console.log(`历史消息: 将被自动过滤`);
   console.log('');
   
   // 创建 WebSocket 客户端
