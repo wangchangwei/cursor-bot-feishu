@@ -85,6 +85,59 @@ const MESSAGE_CACHE_TTL = 5 * 60 * 1000; // 缓存 5 分钟
 // 用于跟踪和管理当前正在执行的任务，支持 stop 命令
 const activeTasks = new Map(); // chatId -> { child, prompt, startTime }
 
+// ========== 会话管理 ==========
+// 用于保持多轮对话的上下文
+const chatSessions = new Map(); // chatId -> { conversationId, lastActiveTime }
+const SESSION_TTL = 30 * 60 * 1000; // 会话超时时间：30 分钟
+
+// 获取或创建会话
+function getSession(chatId) {
+  const session = chatSessions.get(chatId);
+  if (session) {
+    // 检查是否超时
+    if (Date.now() - session.lastActiveTime > SESSION_TTL) {
+      console.log(`[会话] 会话超时，清除: ${chatId}`);
+      chatSessions.delete(chatId);
+      return null;
+    }
+    // 更新活跃时间
+    session.lastActiveTime = Date.now();
+    return session;
+  }
+  return null;
+}
+
+// 保存会话
+function saveSession(chatId, conversationId) {
+  chatSessions.set(chatId, {
+    conversationId,
+    lastActiveTime: Date.now(),
+  });
+  console.log(`[会话] 保存会话: chatId=${chatId}, conversationId=${conversationId}`);
+}
+
+// 清除会话
+function clearSession(chatId) {
+  const session = chatSessions.get(chatId);
+  if (session) {
+    chatSessions.delete(chatId);
+    console.log(`[会话] 清除会话: ${chatId}`);
+    return true;
+  }
+  return false;
+}
+
+// 定期清理过期会话
+setInterval(() => {
+  const now = Date.now();
+  for (const [chatId, session] of chatSessions.entries()) {
+    if (now - session.lastActiveTime > SESSION_TTL) {
+      chatSessions.delete(chatId);
+      console.log(`[会话] 自动清理过期会话: ${chatId}`);
+    }
+  }
+}, 5 * 60 * 1000); // 每 5 分钟检查一次
+
 function isMessageProcessed(messageId) {
   if (processedMessages.has(messageId)) {
     console.log(`[去重] 消息已处理过，跳过: ${messageId}`);
@@ -113,8 +166,20 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
   console.log(`[Cursor CLI] 模式: ${mode}`);
   console.log(`[Cursor CLI] 工作目录: ${config.workDir}`);
   
+  // 获取现有会话（如果有）
+  const existingSession = chatId ? getSession(chatId) : null;
+  const conversationId = existingSession?.conversationId;
+  
   // 构建命令参数
   const args = ['-p', '--force', '--output-format', 'stream-json', '--stream-partial-output'];
+  
+  // 如果有现有会话，使用 --resume 参数继续对话
+  if (conversationId) {
+    args.push('--resume', conversationId);
+    console.log(`[Cursor CLI] 继续会话: ${conversationId}`);
+  } else {
+    console.log(`[Cursor CLI] 开始新会话`);
+  }
   
   console.log(`[Cursor CLI] 命令: agent ${args.join(' ')}`);
   
@@ -149,6 +214,7 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
     
     let result = '';
     let lastAssistantMessage = '';
+    let newConversationId = null;
     let wasKilled = false;
     
     child.stdout.on('data', (data) => {
@@ -160,6 +226,17 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
       for (const line of lines) {
         try {
           const json = JSON.parse(line);
+          
+          // 获取会话 ID（用于后续 --resume）
+          if (json.conversation_id) {
+            newConversationId = json.conversation_id;
+            console.log(`[Cursor CLI] 获取到会话ID: ${newConversationId}`);
+          }
+          
+          // 备用：从其他字段获取会话 ID
+          if (!newConversationId && json.session_id) {
+            newConversationId = json.session_id;
+          }
           
           // 获取最终结果
           if (json.type === 'result' && json.result) {
@@ -189,6 +266,11 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
       if (wasKilled) {
         reject(new Error('STOPPED_BY_USER'));
         return;
+      }
+      
+      // 保存会话 ID（用于后续继续对话）
+      if (chatId && newConversationId) {
+        saveSession(chatId, newConversationId);
       }
       
       // 优先使用 result，否则使用最后的助手消息
@@ -446,6 +528,30 @@ async function handleMessage(event) {
     return;
   }
   
+  // New 命令 - 开始新会话
+  if (text.includes('/new') || text === '新会话' || text === '新对话') {
+    const hadSession = clearSession(chatId);
+    if (hadSession) {
+      await sendMessage(chatId, '🔄 已清除当前会话，下次提问将开始新的对话');
+    } else {
+      await sendMessage(chatId, '当前没有活跃的会话');
+    }
+    return;
+  }
+  
+  // Session 命令 - 查看当前会话状态
+  if (text.includes('/session') || text === '会话状态') {
+    const session = getSession(chatId);
+    if (session) {
+      const activeMinutes = Math.round((Date.now() - session.lastActiveTime) / 60000);
+      const remainMinutes = Math.round((SESSION_TTL - (Date.now() - session.lastActiveTime)) / 60000);
+      await sendMessage(chatId, `📝 当前会话状态\n\n会话ID: ${session.conversationId.substring(0, 20)}...\n上次活跃: ${activeMinutes} 分钟前\n剩余时间: ${remainMinutes} 分钟\n\n发送 /new 可开始新会话`);
+    } else {
+      await sendMessage(chatId, '当前没有活跃的会话，下次提问将开始新对话');
+    }
+    return;
+  }
+  
   // Help 命令 - 帮助信息
   if (text.includes('/help') || text === '帮助') {
     const helpText = `🤖 Cursor AI 助手使用说明
@@ -467,6 +573,14 @@ async function handleMessage(event) {
 ━━━━━━━━━━━━━━━━━━━━━━
 /plan 你的任务
 或：规划：你的任务
+
+━━━━━━━━━━━━━━━━━━━━━━
+💬 会话管理
+━━━━━━━━━━━━━━━━━━━━━━
+会话自动保持，支持多轮对话
+/new - 开始新会话（清除上下文）
+/session - 查看当前会话状态
+会话超时：${SESSION_TTL / 60000} 分钟无活动自动清除
 
 ━━━━━━━━━━━━━━━━━━━━━━
 🛠️ 控制命令
@@ -529,7 +643,11 @@ async function handleMessage(event) {
     ask: '查询',
     plan: '规划',
   };
-  await sendMessage(chatId, `⏳ 正在${modeNames[mode]}中，请稍候...`);
+  
+  // 检查是否有现有会话
+  const existingSession = getSession(chatId);
+  const sessionHint = existingSession ? '（继续对话）' : '（新会话）';
+  await sendMessage(chatId, `⏳ 正在${modeNames[mode]}中${sessionHint}，请稍候...`);
   
   try {
     // 调用 Cursor CLI（传入 chatId 以支持 stop 命令）
