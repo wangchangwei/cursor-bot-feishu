@@ -404,6 +404,55 @@ async function sendMessage(chatId, content, msgType = 'text') {
   }
 }
 
+// ========== 发送 Markdown 消息卡片 ==========
+async function sendMarkdownCard(chatId, content, title = 'Cursor AI 回复') {
+  try {
+    // 截断过长的消息（飞书限制）
+    const maxLength = 30000;
+    let finalContent = content;
+    if (content.length > maxLength) {
+      finalContent = content.substring(0, maxLength) + '\n\n... (内容过长，已截断)';
+    }
+    
+    // 构建消息卡片
+    const card = {
+      config: {
+        wide_screen_mode: true,
+      },
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: title,
+        },
+        template: 'blue',
+      },
+      elements: [
+        {
+          tag: 'markdown',
+          content: finalContent,
+        },
+      ],
+    };
+    
+    await client.im.message.create({
+      params: {
+        receive_id_type: 'chat_id',
+      },
+      data: {
+        receive_id: chatId,
+        msg_type: 'interactive',
+        content: JSON.stringify(card),
+      },
+    });
+    console.log('[飞书] Markdown 卡片发送成功');
+  } catch (error) {
+    console.error('[飞书] Markdown 卡片发送失败:', error.message);
+    // 如果卡片发送失败，降级为纯文本
+    console.log('[飞书] 尝试降级为纯文本发送...');
+    await sendMessage(chatId, content);
+  }
+}
+
 // ========== 上传图片到飞书 ==========
 async function uploadImage(imagePath) {
   try {
@@ -653,8 +702,9 @@ async function handleMessage(event) {
     // 调用 Cursor CLI（传入 chatId 以支持 stop 命令）
     const result = await callCursorCLI(prompt, mode, chatId);
     
-    // 发送结果
-    await sendMessage(chatId, `✅ ${modeNames[mode]}完成\n\n${result}`);
+    // 发送结果（使用 Markdown 卡片格式）
+    const cardTitle = `✅ ${modeNames[mode]}完成`;
+    await sendMarkdownCard(chatId, result, cardTitle);
   } catch (error) {
     console.error('[错误]', error);
     
