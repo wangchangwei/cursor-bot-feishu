@@ -170,12 +170,71 @@ agent mcp list-tools feishu-file-sender
 
 ### 7. 启动服务
 
+#### 方式一：直接启动
+
 ```bash
 # 启动服务
 npm start
 
 # 或开发模式（自动重启）
 npm run dev
+```
+
+#### 方式二：Docker 启动（推荐）
+
+**使用 Docker Compose（推荐）：**
+
+```bash
+# 复制环境变量配置
+cp .env.example .env
+# 编辑 .env 填写飞书凭证
+
+# 构建并启动
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f
+
+# 停止服务
+docker-compose down
+```
+
+**使用 Docker 命令：**
+
+```bash
+# 构建镜像
+docker build -t feishu-cursor-bridge .
+
+# 运行容器
+docker run -d \
+  --name feishu-cursor-bridge \
+  -p 3456:3456 \
+  -e FEISHU_APP_ID=your_app_id \
+  -e FEISHU_APP_SECRET=your_app_secret \
+  -e CURSOR_WORK_DIR=/workspace \
+  feishu-cursor-bridge
+
+# 查看日志
+docker logs -f feishu-cursor-bridge
+
+# 停止容器
+docker stop feishu-cursor-bridge
+docker rm feishu-cursor-bridge
+```
+
+**挂载工作目录：**
+
+如需让容器访问本地项目目录，可以挂载 volume：
+
+```bash
+docker run -d \
+  --name feishu-cursor-bridge \
+  -p 3456:3456 \
+  -v /path/to/your/projects:/workspace \
+  -e FEISHU_APP_ID=your_app_id \
+  -e FEISHU_APP_SECRET=your_app_secret \
+  -e CURSOR_WORK_DIR=/workspace \
+  feishu-cursor-bridge
 ```
 
 启动成功后会显示：
@@ -294,6 +353,9 @@ cursor-bot-feishu/
 ├── package.json          # 项目配置
 ├── .env.example          # 环境变量模板
 ├── .env                  # 环境变量（不提交）
+├── Dockerfile            # Docker 镜像构建文件
+├── docker-compose.yml    # Docker Compose 配置
+├── .dockerignore         # Docker 构建忽略文件
 ├── cursor-bridge.log     # 运行日志（自动生成）
 └── README.md             # 使用说明
 ```
@@ -329,6 +391,22 @@ A: 检查以下几点：
 1. App ID 和 App Secret 是否正确
 2. 应用是否已发布
 3. 是否添加了必要的权限
+
+### Q: Docker 容器启动失败
+
+A: 检查以下几点：
+1. 确保 `.env` 文件已配置且包含必要的环境变量
+2. 端口 3456 是否被占用：`netstat -tlnp | grep 3456`
+3. 查看容器日志：`docker-compose logs` 或 `docker logs feishu-cursor-bridge`
+
+### Q: Docker 中如何更新代码
+
+A: 重新构建镜像并启动：
+```bash
+docker-compose down
+docker-compose build --no-cache
+docker-compose up -d
+```
 
 ## 开发
 
