@@ -21,3 +21,9 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.temp
+
+# 服务 PID 文件
+.service.pid
+
+# 服务运行日志
+service.log

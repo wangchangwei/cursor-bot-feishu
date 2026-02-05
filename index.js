@@ -7,13 +7,18 @@
  * @version 1.0.0
  */
 
-import 'dotenv/config';
+import { config as dotenvConfig } from 'dotenv';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import http from 'http';
 import screenshot from 'screenshot-desktop';
+
+// 从脚本所在目录加载 .env（确保 launchd 等场景下也能正确读取）
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenvConfig({ path: path.join(__dirname, '.env') });
 
 // ========== 配置 ==========
 const config = {

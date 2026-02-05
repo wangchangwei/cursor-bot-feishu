@@ -170,7 +170,26 @@ agent mcp list-tools feishu-file-sender
 
 ### 7. 启动服务
 
-#### 方式一：直接启动
+#### 方式一：后台运行（推荐）
+
+```bash
+# 启动服务（后台运行）
+./service.sh start
+
+# 查看状态
+./service.sh status
+
+# 查看日志
+./service.sh logs
+
+# 重启服务
+./service.sh restart
+
+# 停止服务
+./service.sh stop
+```
+
+#### 方式二：前台运行
 
 ```bash
 # 启动服务
@@ -178,63 +197,6 @@ npm start
 
 # 或开发模式（自动重启）
 npm run dev
-```
-
-#### 方式二：Docker 启动（推荐）
-
-**使用 Docker Compose（推荐）：**
-
-```bash
-# 复制环境变量配置
-cp .env.example .env
-# 编辑 .env 填写飞书凭证
-
-# 构建并启动
-docker-compose up -d
-
-# 查看日志
-docker-compose logs -f
-
-# 停止服务
-docker-compose down
-```
-
-**使用 Docker 命令：**
-
-```bash
-# 构建镜像
-docker build -t feishu-cursor-bridge .
-
-# 运行容器
-docker run -d \
-  --name feishu-cursor-bridge \
-  -p 3456:3456 \
-  -e FEISHU_APP_ID=your_app_id \
-  -e FEISHU_APP_SECRET=your_app_secret \
-  -e CURSOR_WORK_DIR=/workspace \
-  feishu-cursor-bridge
-
-# 查看日志
-docker logs -f feishu-cursor-bridge
-
-# 停止容器
-docker stop feishu-cursor-bridge
-docker rm feishu-cursor-bridge
-```
-
-**挂载工作目录：**
-
-如需让容器访问本地项目目录，可以挂载 volume：
-
-```bash
-docker run -d \
-  --name feishu-cursor-bridge \
-  -p 3456:3456 \
-  -v /path/to/your/projects:/workspace \
-  -e FEISHU_APP_ID=your_app_id \
-  -e FEISHU_APP_SECRET=your_app_secret \
-  -e CURSOR_WORK_DIR=/workspace \
-  feishu-cursor-bridge
 ```
 
 启动成功后会显示：
@@ -353,9 +315,7 @@ cursor-bot-feishu/
 ├── package.json          # 项目配置
 ├── .env.example          # 环境变量模板
 ├── .env                  # 环境变量（不提交）
-├── Dockerfile            # Docker 镜像构建文件
-├── docker-compose.yml    # Docker Compose 配置
-├── .dockerignore         # Docker 构建忽略文件
+├── service.sh            # 服务管理脚本（启动/停止/重启）
 ├── cursor-bridge.log     # 运行日志（自动生成）
 └── README.md             # 使用说明
 ```
@@ -392,21 +352,16 @@ A: 检查以下几点：
 2. 应用是否已发布
 3. 是否添加了必要的权限
 
-### Q: Docker 容器启动失败
+### Q: 为什么不支持 Docker 部署
 
-A: 检查以下几点：
-1. 确保 `.env` 文件已配置且包含必要的环境变量
-2. 端口 3456 是否被占用：`netstat -tlnp | grep 3456`
-3. 查看容器日志：`docker-compose logs` 或 `docker logs feishu-cursor-bridge`
+A: 本服务的核心功能是通过 `spawn('agent', ...)` 调用宿主机上的 Cursor CLI，Docker 容器无法实现这一点：
 
-### Q: Docker 中如何更新代码
+1. **Cursor CLI 是本地桌面工具** — `agent` 命令依赖宿主机的 Cursor 登录态和配置，无法在容器内安装和使用
+2. **进程隔离** — Docker 容器无法直接 spawn 宿主机上的二进制程序
+3. **工作目录不互通** — Cursor CLI 需要访问宿主机的项目文件，容器内的文件系统与宿主机隔离
+4. **MCP Server 依赖宿主机** — `mcp-server.js` 需要被宿主机上的 Cursor CLI 通过 stdio 调用，跨容器无法实现
 
-A: 重新构建镜像并启动：
-```bash
-docker-compose down
-docker-compose build --no-cache
-docker-compose up -d
-```
+虽然理论上可以通过 HTTP 代理中转来间接调用，但会增加不必要的复杂度和延迟。请直接在本地运行。
 
 ## 开发
 
