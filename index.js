@@ -96,7 +96,7 @@ let currentActiveChatId = null;
 // ========== 会话管理 ==========
 // 用于保持多轮对话的上下文
 const chatSessions = new Map(); // chatId -> { conversationId, lastActiveTime }
-const SESSION_TTL = 30 * 60 * 1000; // 会话超时时间：30 分钟
+const SESSION_TTL = 10 * 60 * 60 * 1000; // 会话超时时间：10 小时
 
 // 获取或创建会话
 function getSession(chatId) {
@@ -844,9 +844,19 @@ async function handleMessage(event) {
   if (text.includes('/session') || text === '会话状态') {
     const session = getSession(chatId);
     if (session) {
-      const activeMinutes = Math.round((Date.now() - session.lastActiveTime) / 60000);
-      const remainMinutes = Math.round((SESSION_TTL - (Date.now() - session.lastActiveTime)) / 60000);
-      await sendMessage(chatId, `📝 当前会话状态\n\n会话ID: ${session.conversationId.substring(0, 20)}...\n上次活跃: ${activeMinutes} 分钟前\n剩余时间: ${remainMinutes} 分钟\n\n发送 /new 可开始新会话`);
+      const activeMs = Date.now() - session.lastActiveTime;
+      const remainMs = SESSION_TTL - activeMs;
+      // 智能显示时间（超过60分钟显示小时）
+      const formatTime = (ms) => {
+        const minutes = Math.round(ms / 60000);
+        if (minutes >= 60) {
+          const hours = Math.floor(minutes / 60);
+          const mins = minutes % 60;
+          return mins > 0 ? `${hours} 小时 ${mins} 分钟` : `${hours} 小时`;
+        }
+        return `${minutes} 分钟`;
+      };
+      await sendMessage(chatId, `📝 当前会话状态\n\n会话ID: ${session.conversationId.substring(0, 20)}...\n上次活跃: ${formatTime(activeMs)}前\n剩余时间: ${formatTime(remainMs)}\n\n发送 /new 可开始新会话`);
     } else {
       await sendMessage(chatId, '当前没有活跃的会话，下次提问将开始新对话');
     }
@@ -881,7 +891,7 @@ async function handleMessage(event) {
 会话自动保持，支持多轮对话
 /new - 开始新会话（清除上下文）
 /session - 查看当前会话状态
-会话超时：${SESSION_TTL / 60000} 分钟无活动自动清除
+会话超时：${SESSION_TTL / 3600000} 小时无活动自动清除
 
 ━━━━━━━━━━━━━━━━━━━━━━
 🛠️ 控制命令
