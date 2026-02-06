@@ -40,8 +40,8 @@ start() {
 
   echo -e "${GREEN}🚀 启动 $APP_NAME ...${NC}"
 
-  # 后台运行，日志输出到文件
-  nohup node "$APP_DIR/$ENTRY" >> "$LOG_FILE" 2>&1 &
+  # 后台运行，caffeinate -s 阻止系统休眠以保持网络连接
+  nohup caffeinate -s node "$APP_DIR/$ENTRY" >> "$LOG_FILE" 2>&1 &
   local new_pid=$!
 
   # 等待一小段时间确认进程存活

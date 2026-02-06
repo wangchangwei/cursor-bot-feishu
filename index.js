@@ -29,8 +29,8 @@ const config = {
   // Cursor CLI 工作目录（可选，默认当前目录）
   workDir: process.env.CURSOR_WORK_DIR || process.cwd(),
   
-  // 命令超时时间（毫秒），默认 5 分钟
-  timeout: parseInt(process.env.CURSOR_TIMEOUT) || 300000,
+  // 命令超时时间（毫秒），默认 20 分钟
+  timeout: parseInt(process.env.CURSOR_TIMEOUT) || 1200000,
   
   // ripgrep 路径（可选，如果已在系统 PATH 中则无需配置）
   ripgrepPath: process.env.RIPGREP_PATH || '',
@@ -173,8 +173,8 @@ const client = new lark.Client({
   disableTokenCache: false,
 });
 
-// ========== 调用 Cursor CLI ==========
-async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
+// ========== 调用 Cursor CLI（支持流式回调） ==========
+async function callCursorCLI(prompt, mode = 'agent', chatId = null, onStream = null) {
   console.log(`[Cursor CLI] 执行任务: ${prompt.substring(0, 50)}...`);
   console.log(`[Cursor CLI] 模式: ${mode}`);
   console.log(`[Cursor CLI] 工作目录: ${config.workDir}`);
@@ -226,9 +226,39 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
     };
     
     let result = '';
-    let lastAssistantMessage = '';
+    let accumulatedText = ''; // 累积所有流式 delta 片段
     let newConversationId = null;
     let wasKilled = false;
+    
+    // 流式更新节流：最快 1.5 秒更新一次卡片
+    let lastStreamTime = 0;
+    let streamTimer = null;
+    let streamUpdatePromise = Promise.resolve(); // 确保更新按顺序执行
+    const STREAM_INTERVAL = 1500;
+    
+    const flushStream = (text) => {
+      if (onStream && text) {
+        // 链式执行，确保上一次更新完成后再发下一次
+        streamUpdatePromise = streamUpdatePromise
+          .then(() => onStream(text))
+          .catch(() => {}); // 忽略更新失败
+        lastStreamTime = Date.now();
+      }
+    };
+    
+    const throttledStream = (text) => {
+      if (!onStream || !text) return;
+      const now = Date.now();
+      // 清除上一个定时器
+      if (streamTimer) clearTimeout(streamTimer);
+      if (now - lastStreamTime >= STREAM_INTERVAL) {
+        // 距离上次更新已超过间隔，立即更新
+        flushStream(text);
+      } else {
+        // 还没到间隔，延迟更新（确保最后一次内容也能送达）
+        streamTimer = setTimeout(() => flushStream(text), STREAM_INTERVAL - (now - lastStreamTime));
+      }
+    };
     
     child.stdout.on('data', (data) => {
       const text = data.toString();
@@ -257,9 +287,17 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
             console.log(`[Cursor CLI] 获取到结果: ${result.substring(0, 100)}...`);
           }
           
-          // 获取助手消息（备用）
+          // 获取助手消息 + 触发流式回调
           if (json.type === 'assistant' && json.message?.content?.[0]?.text) {
-            lastAssistantMessage = json.message.content[0].text;
+            const chunkText = json.message.content[0].text;
+            if (json.timestamp_ms) {
+              // 有 timestamp_ms 的是增量 delta 片段，需要累加
+              accumulatedText += chunkText;
+            } else {
+              // 没有 timestamp_ms 的是最终完整文本，直接使用
+              accumulatedText = chunkText;
+            }
+            throttledStream(accumulatedText);
           }
         } catch (e) {
           // 忽略非 JSON 行
@@ -271,9 +309,13 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
       console.log(`[Cursor CLI 错误] ${data.toString()}`);
     });
     
-    child.on('close', (code) => {
+    child.on('close', async (code) => {
       console.log(`[Cursor CLI] 退出码: ${code}`);
       cleanupTask();
+      if (streamTimer) clearTimeout(streamTimer);
+      
+      // 等待所有流式更新完成，避免和最终更新竞争
+      try { await streamUpdatePromise; } catch(e) {}
       
       // 如果是被用户手动终止的
       if (wasKilled) {
@@ -286,8 +328,8 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
         saveSession(chatId, newConversationId);
       }
       
-      // 优先使用 result，否则使用最后的助手消息
-      const finalResult = result || lastAssistantMessage;
+      // 优先使用 result，否则使用累积的文本
+      const finalResult = result || accumulatedText;
       
       if (finalResult) {
         resolve(finalResult);
@@ -301,6 +343,7 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
     child.on('error', (err) => {
       console.log(`[Cursor CLI] 错误: ${err.message}`);
       cleanupTask();
+      if (streamTimer) clearTimeout(streamTimer);
       reject(err);
     });
     
@@ -318,7 +361,7 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
       if (!child.killed) {
         child.kill();
         cleanupTask();
-        reject(new Error('命令执行超时（5分钟）'));
+        reject(new Error('命令执行超时（20分钟）'));
       }
     }, config.timeout);
   });
@@ -417,52 +460,65 @@ async function sendMessage(chatId, content, msgType = 'text') {
   }
 }
 
-// ========== 发送 Markdown 消息卡片 ==========
-async function sendMarkdownCard(chatId, content, title = 'Cursor AI 回复') {
+// ========== 构建卡片 JSON ==========
+function buildCard(content, title = 'Cursor AI 回复', template = 'blue') {
+  const maxLength = 30000;
+  let finalContent = content;
+  if (content.length > maxLength) {
+    finalContent = content.substring(0, maxLength) + '\n\n... (内容过长，已截断)';
+  }
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: title },
+      template,
+    },
+    elements: [
+      { tag: 'markdown', content: finalContent },
+    ],
+  };
+}
+
+// ========== 发送 Markdown 消息卡片（返回 message_id） ==========
+async function sendMarkdownCard(chatId, content, title = 'Cursor AI 回复', template = 'blue') {
   try {
-    // 截断过长的消息（飞书限制）
-    const maxLength = 30000;
-    let finalContent = content;
-    if (content.length > maxLength) {
-      finalContent = content.substring(0, maxLength) + '\n\n... (内容过长，已截断)';
-    }
-    
-    // 构建消息卡片
-    const card = {
-      config: {
-        wide_screen_mode: true,
-      },
-      header: {
-        title: {
-          tag: 'plain_text',
-          content: title,
-        },
-        template: 'blue',
-      },
-      elements: [
-        {
-          tag: 'markdown',
-          content: finalContent,
-        },
-      ],
-    };
-    
-    await client.im.message.create({
-      params: {
-        receive_id_type: 'chat_id',
-      },
+    const card = buildCard(content, title, template);
+    const resp = await client.im.message.create({
+      params: { receive_id_type: 'chat_id' },
       data: {
         receive_id: chatId,
         msg_type: 'interactive',
         content: JSON.stringify(card),
       },
     });
-    console.log('[飞书] Markdown 卡片发送成功');
+    // 飞书 SDK 响应可能嵌套在 data 中
+    const messageId = resp?.message_id || resp?.data?.message_id || null;
+    console.log(`[飞书] Markdown 卡片发送成功 (message_id: ${messageId})`);
+    if (!messageId) {
+      console.log(`[飞书] 响应结构: ${JSON.stringify(resp).substring(0, 500)}`);
+    }
+    return messageId;
   } catch (error) {
     console.error('[飞书] Markdown 卡片发送失败:', error.message);
-    // 如果卡片发送失败，降级为纯文本
     console.log('[飞书] 尝试降级为纯文本发送...');
     await sendMessage(chatId, content);
+    return null;
+  }
+}
+
+// ========== 更新已有的 Markdown 卡片（流式更新） ==========
+async function updateMarkdownCard(messageId, content, title = 'Cursor AI 回复', template = 'blue') {
+  if (!messageId) return;
+  try {
+    const card = buildCard(content, title, template);
+    await client.im.message.patch({
+      path: { message_id: messageId },
+      data: {
+        content: JSON.stringify(card),
+      },
+    });
+  } catch (error) {
+    console.error('[飞书] 卡片更新失败:', error.message);
   }
 }
 
@@ -1030,7 +1086,10 @@ async function handleMessage(event) {
   // 检查是否有现有会话
   const existingSession = getSession(chatId);
   const sessionHint = existingSession ? '（继续对话）' : '（新会话）';
-  await sendMessage(chatId, `⏳ 正在${modeNames[mode]}中${sessionHint}，请稍候...`);
+  
+  // 发送初始流式卡片（替代"请稍候"）
+  const streamingTitle = `⏳ ${modeNames[mode]}中${sessionHint}...`;
+  const streamCardId = await sendMarkdownCard(chatId, '思考中...', streamingTitle, 'wathet');
   
   // 设置当前活跃的 chatId（供 API 接口使用）
   currentActiveChatId = chatId;
@@ -1039,16 +1098,21 @@ async function handleMessage(event) {
   const beforeSnapshot = getFileSnapshot();
   
   try {
-    // 调用 Cursor CLI（传入 chatId 以支持 stop 命令）
-    const result = await callCursorCLI(prompt, mode, chatId);
+    // 流式回调：实时更新飞书卡片（返回 Promise 以支持链式等待）
+    const onStream = (text) => {
+      return updateMarkdownCard(streamCardId, text, streamingTitle, 'wathet');
+    };
+    
+    // 调用 Cursor CLI（传入 chatId 以支持 stop 命令 + 流式回调）
+    const result = await callCursorCLI(prompt, mode, chatId, onStream);
     
     // 执行后获取文件快照
     const afterSnapshot = getFileSnapshot();
     const { newFiles, modifiedFiles } = compareSnapshots(beforeSnapshot, afterSnapshot);
     
-    // 发送结果（使用 Markdown 卡片格式）
+    // 最终更新卡片为完成状态
     const cardTitle = `✅ ${modeNames[mode]}完成`;
-    await sendMarkdownCard(chatId, result, cardTitle);
+    await updateMarkdownCard(streamCardId, result, cardTitle, 'green');
     
     // 检查用户是否要求发送文件
     const wantsSendFile = /发送|发给我|给我|发我|传给我|send|发到飞书/.test(prompt);
