@@ -755,75 +755,6 @@ function formatFileSize(bytes) {
   return (bytes / 1024 / 1024).toFixed(2) + ' MB';
 }
 
-// ========== 获取目录下所有文件的快照 ==========
-function getFileSnapshot(dirPath = config.workDir) {
-  const snapshot = new Map();
-  
-  function scanDir(dir, depth = 0) {
-    if (depth > 3) return; // 限制递归深度
-    
-    try {
-      const items = fs.readdirSync(dir, { withFileTypes: true });
-      
-      for (const item of items) {
-        // 跳过隐藏文件和 node_modules
-        if (item.name.startsWith('.') || item.name === 'node_modules') {
-          continue;
-        }
-        
-        const fullPath = path.join(dir, item.name);
-        
-        if (item.isFile()) {
-          try {
-            const stats = fs.statSync(fullPath);
-            snapshot.set(fullPath, {
-              size: stats.size,
-              mtime: stats.mtimeMs,
-            });
-          } catch (e) {
-            // 忽略无法读取的文件
-          }
-        } else if (item.isDirectory()) {
-          scanDir(fullPath, depth + 1);
-        }
-      }
-    } catch (e) {
-      // 忽略无法读取的目录
-    }
-  }
-  
-  scanDir(dirPath);
-  return snapshot;
-}
-
-// ========== 比较文件快照，找出新建和修改的文件 ==========
-function compareSnapshots(before, after) {
-  const newFiles = [];
-  const modifiedFiles = [];
-  
-  for (const [filePath, afterInfo] of after.entries()) {
-    const beforeInfo = before.get(filePath);
-    const relativePath = path.relative(config.workDir, filePath);
-    
-    if (!beforeInfo) {
-      // 新文件
-      newFiles.push({
-        path: relativePath,
-        fullPath: filePath,
-        size: afterInfo.size,
-      });
-    } else if (afterInfo.mtime > beforeInfo.mtime || afterInfo.size !== beforeInfo.size) {
-      // 修改的文件
-      modifiedFiles.push({
-        path: relativePath,
-        fullPath: filePath,
-        size: afterInfo.size,
-      });
-    }
-  }
-  
-  return { newFiles, modifiedFiles };
-}
 
 // ========== 发送图片消息 ==========
 async function sendImage(chatId, imageKey, replyToMessageId = null) {
@@ -1149,9 +1080,6 @@ async function handleMessage(event) {
   // 设置当前活跃的 chatId（供 API 接口使用）
   currentActiveChatId = chatId;
   
-  // 执行前获取文件快照（用于检测新生成的文件）
-  const beforeSnapshot = getFileSnapshot();
-  
   try {
     // 流式回调：实时更新飞书卡片（返回 Promise 以支持链式等待）
     const onStream = (text) => {
@@ -1161,61 +1089,9 @@ async function handleMessage(event) {
     // 调用 Cursor CLI（传入 threadKey 以支持 stop 命令 + 流式回调）
     const result = await callCursorCLI(prompt, mode, threadKey, onStream);
     
-    // 执行后获取文件快照
-    const afterSnapshot = getFileSnapshot();
-    const { newFiles, modifiedFiles } = compareSnapshots(beforeSnapshot, afterSnapshot);
-    
     // 最终更新卡片为完成状态
     const cardTitle = `✅ ${modeNames[mode]}完成`;
     await updateMarkdownCard(streamCardId, result, cardTitle, 'green');
-    
-    // 检查用户是否要求发送文件
-    const wantsSendFile = /发送|发给我|给我|发我|传给我|send|发到飞书/.test(prompt);
-    
-    // 如果有新建的文件
-    if (newFiles.length > 0) {
-      // 如果用户要求发送文件，自动发送新建的文件
-      if (wantsSendFile) {
-        await sendMessage(chatId, `📤 正在发送 ${newFiles.length} 个新文件...`, 'text', replyToMessageId);
-        
-        let successCount = 0;
-        let failedFiles = [];
-        
-        for (const file of newFiles.slice(0, 5)) { // 最多发送 5 个文件
-          try {
-            await sendLocalFile(chatId, file.fullPath, replyToMessageId);
-            successCount++;
-          } catch (error) {
-            failedFiles.push({ name: file.path, error: error.message });
-          }
-        }
-        
-        if (successCount > 0) {
-          let notice = `✅ 成功发送 ${successCount} 个文件`;
-          if (newFiles.length > 5) {
-            notice += `\n\n还有 ${newFiles.length - 5} 个文件未发送，使用 /ls 查看`;
-          }
-          if (failedFiles.length > 0) {
-            notice += `\n\n❌ ${failedFiles.length} 个文件发送失败`;
-          }
-          await sendMessage(chatId, notice, 'text', replyToMessageId);
-        } else if (failedFiles.length > 0) {
-          await sendMessage(chatId, `❌ 文件发送失败: ${failedFiles[0].error}`, 'text', replyToMessageId);
-        }
-      } else {
-        // 不需要发送，只提示有新文件
-        let fileNotice = '📂 **检测到新文件**\n\n';
-        newFiles.slice(0, 10).forEach(f => {
-          fileNotice += `• ${f.path} (${formatFileSize(f.size)})\n`;
-        });
-        if (newFiles.length > 10) {
-          fileNotice += `\n... 还有 ${newFiles.length - 10} 个文件\n`;
-        }
-        fileNotice += '\n💡 发送 `/file <路径>` 获取文件';
-        
-        await sendMarkdownCard(chatId, fileNotice, '📂 新文件', 'blue', replyToMessageId);
-      }
-    }
   } catch (error) {
     console.error('[错误]', error);
     
