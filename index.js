@@ -9,7 +9,7 @@
 
 import { config as dotenvConfig } from 'dotenv';
 import * as lark from '@larksuiteoapi/node-sdk';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -786,6 +786,191 @@ async function sendImage(chatId, imageKey, replyToMessageId = null) {
   }
 }
 
+// ========== 获取摄像头设备列表 ==========
+function getVideoDevices() {
+  try {
+    // 不同平台使用不同的方式列出设备
+    let output;
+    if (process.platform === 'win32') {
+      output = execSync('ffmpeg -list_devices true -f dshow -i dummy 2>&1 || exit 0', {
+        encoding: 'utf-8',
+        timeout: 10000,
+        shell: true,
+      });
+    } else {
+      output = execSync('ffmpeg -f avfoundation -list_devices true -i "" 2>&1 || true', {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+    }
+
+    console.log('[摄像头] ffmpeg 输出长度:', output.length);
+
+    const devices = [];
+    const lines = output.split('\n');
+
+    if (process.platform === 'win32') {
+      // Windows dshow: 两种格式兼容
+      // 新版 ffmpeg: [dshow @ ...] "DeviceName" (video)
+      // 旧版 ffmpeg: [dshow @ ...] DirectShow video devices: 然后逐行列出
+      let inVideoSection = false;
+
+      for (const line of lines) {
+        // 方式1: 直接匹配带 (video) 后缀的设备行（新版 ffmpeg）
+        const videoMatch = line.match(/"([^"]+)"\s*\(video\)/);
+        if (videoMatch) {
+          devices.push({ index: devices.length, name: videoMatch[1] });
+          continue;
+        }
+
+        // 方式2: 旧版 ffmpeg 带 section header
+        if (line.includes('DirectShow video devices')) {
+          inVideoSection = true;
+          continue;
+        }
+        if (line.includes('DirectShow audio devices')) {
+          inVideoSection = false;
+          continue;
+        }
+        if (inVideoSection) {
+          const match = line.match(/"([^"]+)"/);
+          if (match && !line.includes('Alternative name')) {
+            devices.push({ index: devices.length, name: match[1] });
+          }
+        }
+      }
+    } else {
+      // macOS avfoundation
+      let inVideoSection = false;
+      for (const line of lines) {
+        if (line.includes('AVFoundation video devices:')) {
+          inVideoSection = true;
+          continue;
+        }
+        if (line.includes('AVFoundation audio devices:')) {
+          inVideoSection = false;
+          continue;
+        }
+        if (inVideoSection) {
+          const match = line.match(/\[(\d+)\]\s+(.+)/);
+          if (match) {
+            devices.push({ index: parseInt(match[1]), name: match[2].trim() });
+          }
+        }
+      }
+    }
+
+    return devices;
+  } catch (error) {
+    console.error('[摄像头] 获取设备列表失败:', error.message);
+    return [];
+  }
+}
+
+// ========== 拍照并发送 ==========
+async function captureAndSendPhoto(chatId, replyToMessageId = null) {
+  const tempPath = path.join(process.env.TEMP || '/tmp', `photo_${Date.now()}.jpg`);
+
+  try {
+    console.log('[拍照] 开始从摄像头捕获照片...');
+
+    // 获取摄像头设备
+    const devices = getVideoDevices();
+    console.log(`[拍照] 检测到 ${devices.length} 个视频设备:`, devices.map(d => d.name).join(', '));
+
+    if (devices.length === 0) {
+      throw new Error('未检测到摄像头设备，请确认摄像头已连接且 ffmpeg 已安装');
+    }
+
+    // 使用第一个摄像头设备
+    const device = devices[0];
+    console.log(`[拍照] 使用设备: ${device.name}`);
+
+    // 使用 ffmpeg 从摄像头捕获一帧
+    await new Promise((resolve, reject) => {
+      let ffmpegArgs;
+      if (process.platform === 'win32') {
+        // Windows: dshow
+        ffmpegArgs = [
+          '-f', 'dshow',
+          '-i', `video=${device.name}`,
+          '-frames:v', '1',
+          '-q:v', '2',
+          '-y',
+          tempPath,
+        ];
+      } else {
+        // macOS: avfoundation
+        ffmpegArgs = [
+          '-f', 'avfoundation',
+          '-i', `${device.index}:none`,
+          '-frames:v', '1',
+          '-q:v', '2',
+          '-y',
+          tempPath,
+        ];
+      }
+
+      console.log(`[拍照] 执行: ffmpeg ${ffmpegArgs.join(' ')}`);
+      const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stderr = '';
+      ffmpeg.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      ffmpeg.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`ffmpeg 退出码: ${code}\n${stderr.slice(-500)}`));
+        }
+      });
+
+      ffmpeg.on('error', (err) => {
+        reject(new Error(`无法启动 ffmpeg: ${err.message}，请确认 ffmpeg 已安装并在 PATH 中`));
+      });
+
+      // 超时 15 秒
+      setTimeout(() => {
+        ffmpeg.kill('SIGKILL');
+        reject(new Error('拍照超时（15秒），请检查摄像头是否正常'));
+      }, 15000);
+    });
+
+    // 检查文件是否生成
+    if (!fs.existsSync(tempPath)) {
+      throw new Error('照片文件未生成');
+    }
+
+    const stats = fs.statSync(tempPath);
+    console.log(`[拍照] 照片已保存: ${tempPath} (${stats.size} bytes)`);
+
+    // 上传图片到飞书
+    const imageKey = await uploadImage(tempPath);
+
+    // 发送图片消息
+    await sendImage(chatId, imageKey, replyToMessageId);
+
+    return true;
+  } catch (error) {
+    console.error('[拍照] 失败:', error.message);
+    throw error;
+  } finally {
+    // 清理临时文件
+    try {
+      if (fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
+        console.log('[拍照] 临时文件已清理');
+      }
+    } catch (e) {
+      // 忽略清理错误
+    }
+  }
+}
+
 // ========== 截图并发送 ==========
 async function captureAndSendScreenshot(chatId, replyToMessageId = null) {
   const tempPath = path.join(process.env.TEMP || '/tmp', `screenshot_${Date.now()}.png`);
@@ -946,6 +1131,7 @@ async function handleMessage(event) {
 ━━━━━━━━━━━━━━━━━━━━━━
 /stop - 终止当前正在执行的任务
 /screenshot - 截取屏幕并发送
+/photo - 摄像头拍照并发送
 /log [行数] - 查看日志（默认10行）
 /help - 显示此帮助信息
 
@@ -962,6 +1148,17 @@ async function handleMessage(event) {
 工作目录：${config.workDir}`;
     
     await sendMessage(chatId, helpText, 'text', replyToMessageId);
+    return;
+  }
+  
+  // Photo 命令 - 拍照并发送
+  if (text.includes('/photo') || text === '拍照' || text === '拍个照') {
+    await sendMessage(chatId, '📷 正在从摄像头拍照...', 'text', replyToMessageId);
+    try {
+      await captureAndSendPhoto(chatId, replyToMessageId);
+    } catch (error) {
+      await sendMessage(chatId, `❌ 拍照失败：${error.message}`, 'text', replyToMessageId);
+    }
     return;
   }
   

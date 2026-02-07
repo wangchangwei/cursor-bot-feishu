@@ -96,6 +96,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {},
         },
       },
+      {
+        name: 'capture_photo',
+        description: '使用摄像头拍摄一张照片。拍照完成后返回文件路径，可配合 send_file_to_feishu 发送给用户。',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            output_path: {
+              type: 'string',
+              description: '输出文件路径，默认为 photo_<timestamp>.jpg',
+            },
+            device_name: {
+              type: 'string',
+              description: '可选，指定摄像头设备名称。不指定则自动选择第一个可用摄像头',
+            },
+          },
+        },
+      },
+      {
+        name: 'list_video_devices',
+        description: '列出系统可用的视频输入设备（摄像头）',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
     ],
   };
 });
@@ -279,6 +304,126 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   }
 
+  if (name === 'capture_photo') {
+    const timestamp = Date.now();
+    const outputPath = args.output_path || path.join(process.cwd(), `photo_${timestamp}.jpg`);
+    const absolutePath = path.isAbsolute(outputPath) ? outputPath : path.join(process.cwd(), outputPath);
+    const deviceName = args.device_name || null;
+
+    try {
+      // 获取摄像头设备
+      const devices = getVideoDevices();
+      if (devices.length === 0) {
+        throw new Error('未检测到摄像头设备，请确认摄像头已连接且 ffmpeg 已安装');
+      }
+
+      // 选择设备
+      let selectedDevice = devices[0];
+      if (deviceName) {
+        const found = devices.find(d => d.name.toLowerCase().includes(deviceName.toLowerCase()));
+        if (found) {
+          selectedDevice = found;
+        } else {
+          console.error(`[拍照] 未找到匹配 "${deviceName}" 的设备，使用默认设备: ${devices[0].name}`);
+        }
+      }
+
+      console.error(`[拍照] 使用设备: ${selectedDevice.name}, 输出: ${absolutePath}`);
+
+      // 使用 ffmpeg 从摄像头捕获一帧
+      await new Promise((resolve, reject) => {
+        let ffmpegArgs;
+        if (process.platform === 'win32') {
+          ffmpegArgs = [
+            '-f', 'dshow',
+            '-i', `video=${selectedDevice.name}`,
+            '-frames:v', '1',
+            '-q:v', '2',
+            '-y',
+            absolutePath,
+          ];
+        } else {
+          ffmpegArgs = [
+            '-f', 'avfoundation',
+            '-i', `${selectedDevice.index}:none`,
+            '-frames:v', '1',
+            '-q:v', '2',
+            '-y',
+            absolutePath,
+          ];
+        }
+
+        const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        let stderr = '';
+        ffmpeg.stderr.on('data', (data) => {
+          stderr += data.toString();
+          console.error(`[ffmpeg] ${data.toString()}`);
+        });
+
+        ffmpeg.on('close', (code) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(`ffmpeg 退出码: ${code}\n${stderr.slice(-500)}`));
+          }
+        });
+
+        ffmpeg.on('error', (err) => {
+          reject(new Error(`无法启动 ffmpeg: ${err.message}`));
+        });
+
+        // 超时 15 秒
+        setTimeout(() => {
+          ffmpeg.kill('SIGKILL');
+          reject(new Error('拍照超时（15秒），请检查摄像头是否正常'));
+        }, 15000);
+      });
+
+      if (!fs.existsSync(absolutePath)) {
+        throw new Error('照片文件未生成');
+      }
+
+      const stats = fs.statSync(absolutePath);
+
+      return {
+        content: [{
+          type: 'text',
+          text: `✅ 拍照完成！\n文件路径: ${absolutePath}\n大小: ${formatFileSize(stats.size)}\n设备: ${selectedDevice.name}\n\n可以使用 send_file_to_feishu 工具将此照片发送给用户。`,
+        }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: 'text', text: `❌ 拍照失败: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+
+  if (name === 'list_video_devices') {
+    try {
+      const devices = getVideoDevices();
+      if (devices.length === 0) {
+        return {
+          content: [{ type: 'text', text: '未检测到视频输入设备。请确认摄像头已连接且 ffmpeg 已安装。' }],
+        };
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: `视频输入设备列表:\n\n${devices.map(d => `[${d.index}] ${d.name}`).join('\n')}`,
+        }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: 'text', text: `获取设备列表失败: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+
   return {
     content: [{ type: 'text', text: `未知工具: ${name}` }],
     isError: true,
@@ -290,6 +435,84 @@ function formatFileSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+// 辅助函数：获取视频设备列表
+function getVideoDevices() {
+  try {
+    let output;
+    if (process.platform === 'win32') {
+      output = execSync('ffmpeg -list_devices true -f dshow -i dummy 2>&1 || exit 0', {
+        encoding: 'utf-8',
+        timeout: 10000,
+        shell: true,
+      });
+    } else {
+      output = execSync('ffmpeg -f avfoundation -list_devices true -i "" 2>&1 || true', {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+    }
+
+    const devices = [];
+    const lines = output.split('\n');
+
+    if (process.platform === 'win32') {
+      // Windows dshow: 兼容新旧版 ffmpeg
+      // 新版: [dshow @ ...] "DeviceName" (video)
+      // 旧版: [dshow @ ...] DirectShow video devices: 然后逐行列出
+      let inVideoSection = false;
+
+      for (const line of lines) {
+        // 方式1: 直接匹配带 (video) 后缀的设备行
+        const videoMatch = line.match(/"([^"]+)"\s*\(video\)/);
+        if (videoMatch) {
+          devices.push({ index: devices.length, name: videoMatch[1] });
+          continue;
+        }
+
+        // 方式2: 旧版 ffmpeg 带 section header
+        if (line.includes('DirectShow video devices')) {
+          inVideoSection = true;
+          continue;
+        }
+        if (line.includes('DirectShow audio devices')) {
+          inVideoSection = false;
+          continue;
+        }
+        if (inVideoSection) {
+          const match = line.match(/"([^"]+)"/);
+          if (match && !line.includes('Alternative name')) {
+            devices.push({ index: devices.length, name: match[1] });
+          }
+        }
+      }
+    } else {
+      // macOS avfoundation
+      let inVideoSection = false;
+      for (const line of lines) {
+        if (line.includes('AVFoundation video devices:')) {
+          inVideoSection = true;
+          continue;
+        }
+        if (line.includes('AVFoundation audio devices:')) {
+          inVideoSection = false;
+          continue;
+        }
+        if (inVideoSection) {
+          const match = line.match(/\[(\d+)\]\s+(.+)/);
+          if (match) {
+            devices.push({ index: parseInt(match[1]), name: match[2].trim() });
+          }
+        }
+      }
+    }
+
+    return devices;
+  } catch (error) {
+    console.error('获取视频设备失败:', error.message);
+    return [];
+  }
 }
 
 // 辅助函数：获取音频设备列表
