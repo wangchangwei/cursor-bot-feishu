@@ -13,6 +13,7 @@
     "@anthropic-ai/sdk": "^0.72.1",
     "@larksuiteoapi/node-sdk": "^1.36.1",
     "@modelcontextprotocol/sdk": "^1.25.3",
+    "cross-spawn": "^7.0.6",
     "dotenv": "^17.2.3",
     "screenshot-desktop": "^1.15.3"
   }

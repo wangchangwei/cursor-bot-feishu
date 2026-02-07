@@ -9,7 +9,7 @@
 
 import { config as dotenvConfig } from 'dotenv';
 import * as lark from '@larksuiteoapi/node-sdk';
-import { spawn } from 'child_process';
+import spawn from 'cross-spawn';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -205,7 +205,6 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null) {
     const child = spawn('agent', args, {
       cwd: config.workDir,
       env: cleanEnv,
-      shell: true,
       stdio: ['pipe', 'pipe', 'pipe']
     });
     
