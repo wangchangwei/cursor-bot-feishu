@@ -432,7 +432,8 @@ function parseMessage(text) {
 }
 
 // ========== 发送飞书消息 ==========
-async function sendMessage(chatId, content, msgType = 'text') {
+// replyToMessageId: 如果在话题中，传入要回复的消息 ID，消息会发送到同一话题
+async function sendMessage(chatId, content, msgType = 'text', replyToMessageId = null) {
   try {
     // 截断过长的消息（飞书限制）
     const maxLength = 30000;
@@ -441,18 +442,28 @@ async function sendMessage(chatId, content, msgType = 'text') {
       finalContent = content.substring(0, maxLength) + '\n\n... (内容过长，已截断)';
     }
     
-    await client.im.message.create({
-      params: {
-        receive_id_type: 'chat_id',
-      },
-      data: {
-        receive_id: chatId,
-        msg_type: msgType,
-        content: JSON.stringify({
-          text: finalContent,
-        }),
-      },
-    });
+    const msgContent = JSON.stringify({ text: finalContent });
+    
+    if (replyToMessageId) {
+      // 话题模式：回复到话题中
+      await client.im.message.reply({
+        path: { message_id: replyToMessageId },
+        data: {
+          msg_type: msgType,
+          content: msgContent,
+        },
+      });
+    } else {
+      // 普通模式：直接发送到聊天
+      await client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: msgType,
+          content: msgContent,
+        },
+      });
+    }
     console.log('[飞书] 消息发送成功');
   } catch (error) {
     console.error('[飞书] 消息发送失败:', error.message);
@@ -479,17 +490,32 @@ function buildCard(content, title = 'Cursor AI 回复', template = 'blue') {
 }
 
 // ========== 发送 Markdown 消息卡片（返回 message_id） ==========
-async function sendMarkdownCard(chatId, content, title = 'Cursor AI 回复', template = 'blue') {
+async function sendMarkdownCard(chatId, content, title = 'Cursor AI 回复', template = 'blue', replyToMessageId = null) {
   try {
     const card = buildCard(content, title, template);
-    const resp = await client.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: {
-        receive_id: chatId,
-        msg_type: 'interactive',
-        content: JSON.stringify(card),
-      },
-    });
+    const cardJson = JSON.stringify(card);
+    let resp;
+    
+    if (replyToMessageId) {
+      // 话题模式：回复到话题中
+      resp = await client.im.message.reply({
+        path: { message_id: replyToMessageId },
+        data: {
+          msg_type: 'interactive',
+          content: cardJson,
+        },
+      });
+    } else {
+      // 普通模式：直接发送到聊天
+      resp = await client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: cardJson,
+        },
+      });
+    }
     // 飞书 SDK 响应可能嵌套在 data 中
     const messageId = resp?.message_id || resp?.data?.message_id || null;
     console.log(`[飞书] Markdown 卡片发送成功 (message_id: ${messageId})`);
@@ -500,7 +526,7 @@ async function sendMarkdownCard(chatId, content, title = 'Cursor AI 回复', tem
   } catch (error) {
     console.error('[飞书] Markdown 卡片发送失败:', error.message);
     console.log('[飞书] 尝试降级为纯文本发送...');
-    await sendMessage(chatId, content);
+    await sendMessage(chatId, content, 'text', replyToMessageId);
     return null;
   }
 }
@@ -605,20 +631,28 @@ async function uploadFile(filePath) {
 }
 
 // ========== 发送文件消息 ==========
-async function sendFile(chatId, fileKey, fileName) {
+async function sendFile(chatId, fileKey, fileName, replyToMessageId = null) {
   try {
-    await client.im.message.create({
-      params: {
-        receive_id_type: 'chat_id',
-      },
-      data: {
-        receive_id: chatId,
-        msg_type: 'file',
-        content: JSON.stringify({
-          file_key: fileKey,
-        }),
-      },
-    });
+    const msgContent = JSON.stringify({ file_key: fileKey });
+    
+    if (replyToMessageId) {
+      await client.im.message.reply({
+        path: { message_id: replyToMessageId },
+        data: {
+          msg_type: 'file',
+          content: msgContent,
+        },
+      });
+    } else {
+      await client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'file',
+          content: msgContent,
+        },
+      });
+    }
     console.log(`[飞书] 文件消息发送成功: ${fileName}`);
   } catch (error) {
     console.error('[飞书] 文件消息发送失败:', error.message);
@@ -627,7 +661,7 @@ async function sendFile(chatId, fileKey, fileName) {
 }
 
 // ========== 发送本地文件到飞书 ==========
-async function sendLocalFile(chatId, filePath) {
+async function sendLocalFile(chatId, filePath, replyToMessageId = null) {
   try {
     // 处理相对路径
     let absolutePath = filePath;
@@ -656,7 +690,7 @@ async function sendLocalFile(chatId, filePath) {
     const { file_key, file_size } = await uploadFile(absolutePath);
     
     // 发送文件消息
-    await sendFile(chatId, file_key, fileName);
+    await sendFile(chatId, file_key, fileName, replyToMessageId);
     
     return {
       success: true,
@@ -792,20 +826,28 @@ function compareSnapshots(before, after) {
 }
 
 // ========== 发送图片消息 ==========
-async function sendImage(chatId, imageKey) {
+async function sendImage(chatId, imageKey, replyToMessageId = null) {
   try {
-    await client.im.message.create({
-      params: {
-        receive_id_type: 'chat_id',
-      },
-      data: {
-        receive_id: chatId,
-        msg_type: 'image',
-        content: JSON.stringify({
-          image_key: imageKey,
-        }),
-      },
-    });
+    const msgContent = JSON.stringify({ image_key: imageKey });
+    
+    if (replyToMessageId) {
+      await client.im.message.reply({
+        path: { message_id: replyToMessageId },
+        data: {
+          msg_type: 'image',
+          content: msgContent,
+        },
+      });
+    } else {
+      await client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'image',
+          content: msgContent,
+        },
+      });
+    }
     console.log('[飞书] 图片消息发送成功');
   } catch (error) {
     console.error('[飞书] 图片消息发送失败:', error.message);
@@ -814,7 +856,7 @@ async function sendImage(chatId, imageKey) {
 }
 
 // ========== 截图并发送 ==========
-async function captureAndSendScreenshot(chatId) {
+async function captureAndSendScreenshot(chatId, replyToMessageId = null) {
   const tempPath = path.join(process.env.TEMP || '/tmp', `screenshot_${Date.now()}.png`);
   
   try {
@@ -828,7 +870,7 @@ async function captureAndSendScreenshot(chatId) {
     const imageKey = await uploadImage(tempPath);
     
     // 发送图片
-    await sendImage(chatId, imageKey);
+    await sendImage(chatId, imageKey, replyToMessageId);
     
     return true;
   } catch (error) {
@@ -855,6 +897,20 @@ async function handleMessage(event) {
   const msgType = message.message_type;
   const createTime = parseInt(message.create_time); // 消息创建时间（毫秒时间戳）
   
+  // 话题支持：提取话题根消息 ID
+  const rootId = message.root_id || null;
+  const parentId = message.parent_id || null;
+  
+  // 如果消息在话题中，使用消息 ID 作为回复目标（回复会自动归入同一话题）
+  const replyToMessageId = rootId ? messageId : null;
+  
+  // 会话/任务的唯一标识：话题用 chatId:rootId，普通聊天用 chatId
+  const threadKey = rootId ? `${chatId}:${rootId}` : chatId;
+  
+  if (rootId) {
+    console.log(`[话题] 检测到话题消息, rootId: ${rootId}, parentId: ${parentId}`);
+  }
+  
   // 过滤历史消息：只处理服务启动后的消息
   if (createTime < SERVICE_START_TIME) {
     console.log(`[跳过] 历史消息，创建时间: ${new Date(createTime).toLocaleString()}, 服务启动: ${new Date(SERVICE_START_TIME).toLocaleString()}`);
@@ -868,7 +924,7 @@ async function handleMessage(event) {
   
   // 只处理文本消息
   if (msgType !== 'text') {
-    await sendMessage(chatId, '目前只支持文本消息哦~');
+    await sendMessage(chatId, '目前只支持文本消息哦~', 'text', replyToMessageId);
     return;
   }
   
@@ -876,33 +932,33 @@ async function handleMessage(event) {
   const content = JSON.parse(message.content);
   const text = content.text || '';
   
-  console.log(`[收到消息] ${text} (ID: ${messageId})`);
+  console.log(`[收到消息] ${text} (ID: ${messageId}, threadKey: ${threadKey})`);
   
   // Stop 命令 - 终止当前任务
   if (text.includes('/stop') || text === '停止' || text === '终止') {
-    const result = stopTask(chatId);
+    const result = stopTask(threadKey);
     if (result.stopped) {
-      await sendMessage(chatId, `⏹️ 已终止任务\n\n任务：${result.prompt}...\n运行时长：${result.duration} 秒`);
+      await sendMessage(chatId, `⏹️ 已终止任务\n\n任务：${result.prompt}...\n运行时长：${result.duration} 秒`, 'text', replyToMessageId);
     } else {
-      await sendMessage(chatId, '当前没有正在执行的任务');
+      await sendMessage(chatId, '当前没有正在执行的任务', 'text', replyToMessageId);
     }
     return;
   }
   
   // New 命令 - 开始新会话
   if (text.includes('/new') || text === '新会话' || text === '新对话') {
-    const hadSession = clearSession(chatId);
+    const hadSession = clearSession(threadKey);
     if (hadSession) {
-      await sendMessage(chatId, '🔄 已清除当前会话，下次提问将开始新的对话');
+      await sendMessage(chatId, '🔄 已清除当前会话，下次提问将开始新的对话', 'text', replyToMessageId);
     } else {
-      await sendMessage(chatId, '当前没有活跃的会话');
+      await sendMessage(chatId, '当前没有活跃的会话', 'text', replyToMessageId);
     }
     return;
   }
   
   // Session 命令 - 查看当前会话状态
   if (text.includes('/session') || text === '会话状态') {
-    const session = getSession(chatId);
+    const session = getSession(threadKey);
     if (session) {
       const activeMs = Date.now() - session.lastActiveTime;
       const remainMs = SESSION_TTL - activeMs;
@@ -916,9 +972,9 @@ async function handleMessage(event) {
         }
         return `${minutes} 分钟`;
       };
-      await sendMessage(chatId, `📝 当前会话状态\n\n会话ID: ${session.conversationId.substring(0, 20)}...\n上次活跃: ${formatTime(activeMs)}前\n剩余时间: ${formatTime(remainMs)}\n\n发送 /new 可开始新会话`);
+      await sendMessage(chatId, `📝 当前会话状态\n\n会话ID: ${session.conversationId.substring(0, 20)}...\n上次活跃: ${formatTime(activeMs)}前\n剩余时间: ${formatTime(remainMs)}\n\n发送 /new 可开始新会话`, 'text', replyToMessageId);
     } else {
-      await sendMessage(chatId, '当前没有活跃的会话，下次提问将开始新对话');
+      await sendMessage(chatId, '当前没有活跃的会话，下次提问将开始新对话', 'text', replyToMessageId);
     }
     return;
   }
@@ -949,6 +1005,7 @@ async function handleMessage(event) {
 💬 会话管理
 ━━━━━━━━━━━━━━━━━━━━━━
 会话自动保持，支持多轮对话
+群话题中每个话题独立维护会话
 /new - 开始新会话（清除上下文）
 /session - 查看当前会话状态
 会话超时：${SESSION_TTL / 3600000} 小时无活动自动清除
@@ -974,17 +1031,17 @@ async function handleMessage(event) {
 工作目录：${config.workDir}
 超时时间：${config.timeout / 1000} 秒`;
     
-    await sendMessage(chatId, helpText);
+    await sendMessage(chatId, helpText, 'text', replyToMessageId);
     return;
   }
   
   // Screenshot 命令 - 截图并发送
   if (text.includes('/screenshot') || text === '截图' || text === '截屏') {
-    await sendMessage(chatId, '📸 正在截取屏幕...');
+    await sendMessage(chatId, '📸 正在截取屏幕...', 'text', replyToMessageId);
     try {
-      await captureAndSendScreenshot(chatId);
+      await captureAndSendScreenshot(chatId, replyToMessageId);
     } catch (error) {
-      await sendMessage(chatId, `❌ 截图失败：${error.message}`);
+      await sendMessage(chatId, `❌ 截图失败：${error.message}`, 'text', replyToMessageId);
     }
     return;
   }
@@ -1003,7 +1060,7 @@ async function handleMessage(event) {
     }
     
     const logContent = readLogFile(lines);
-    await sendMessage(chatId, logContent);
+    await sendMessage(chatId, logContent, 'text', replyToMessageId);
     return;
   }
   
@@ -1012,17 +1069,17 @@ async function handleMessage(event) {
     const filePath = text.replace(/^(\/file\s+|发送文件\s+|发文件\s+)/, '').trim();
     
     if (!filePath) {
-      await sendMessage(chatId, '请指定文件路径\n\n用法: /file <文件路径>\n例如: /file src/index.js\n\n提示: 使用 /ls 命令查看可用文件');
+      await sendMessage(chatId, '请指定文件路径\n\n用法: /file <文件路径>\n例如: /file src/index.js\n\n提示: 使用 /ls 命令查看可用文件', 'text', replyToMessageId);
       return;
     }
     
-    await sendMessage(chatId, `📤 正在发送文件: ${filePath}`);
+    await sendMessage(chatId, `📤 正在发送文件: ${filePath}`, 'text', replyToMessageId);
     
     try {
-      const result = await sendLocalFile(chatId, filePath);
-      await sendMessage(chatId, `✅ 文件发送成功\n\n文件名: ${result.fileName}\n大小: ${formatFileSize(result.fileSize)}`);
+      const result = await sendLocalFile(chatId, filePath, replyToMessageId);
+      await sendMessage(chatId, `✅ 文件发送成功\n\n文件名: ${result.fileName}\n大小: ${formatFileSize(result.fileSize)}`, 'text', replyToMessageId);
     } catch (error) {
-      await sendMessage(chatId, `❌ 文件发送失败: ${error.message}`);
+      await sendMessage(chatId, `❌ 文件发送失败: ${error.message}`, 'text', replyToMessageId);
     }
     return;
   }
@@ -1038,7 +1095,7 @@ async function handleMessage(event) {
     if (files.length === 0) {
       await sendMessage(chatId, pattern 
         ? `未找到匹配 "${pattern}" 的文件`
-        : '工作目录下没有文件');
+        : '工作目录下没有文件', 'text', replyToMessageId);
       return;
     }
     
@@ -1063,7 +1120,7 @@ async function handleMessage(event) {
     
     fileList += '\n\n💡 使用 /file <路径> 发送文件';
     
-    await sendMessage(chatId, fileList);
+    await sendMessage(chatId, fileList, 'text', replyToMessageId);
     return;
   }
   
@@ -1071,7 +1128,7 @@ async function handleMessage(event) {
   const { mode, prompt } = parseMessage(text);
   
   if (!prompt) {
-    await sendMessage(chatId, '请输入您的问题或任务~');
+    await sendMessage(chatId, '请输入您的问题或任务~', 'text', replyToMessageId);
     return;
   }
   
@@ -1082,13 +1139,13 @@ async function handleMessage(event) {
     plan: '规划',
   };
   
-  // 检查是否有现有会话
-  const existingSession = getSession(chatId);
+  // 检查是否有现有会话（使用 threadKey 区分不同话题）
+  const existingSession = getSession(threadKey);
   const sessionHint = existingSession ? '（继续对话）' : '（新会话）';
   
   // 发送初始流式卡片（替代"请稍候"）
   const streamingTitle = `⏳ ${modeNames[mode]}中${sessionHint}...`;
-  const streamCardId = await sendMarkdownCard(chatId, '思考中...', streamingTitle, 'wathet');
+  const streamCardId = await sendMarkdownCard(chatId, '思考中...', streamingTitle, 'wathet', replyToMessageId);
   
   // 设置当前活跃的 chatId（供 API 接口使用）
   currentActiveChatId = chatId;
@@ -1102,8 +1159,8 @@ async function handleMessage(event) {
       return updateMarkdownCard(streamCardId, text, streamingTitle, 'wathet');
     };
     
-    // 调用 Cursor CLI（传入 chatId 以支持 stop 命令 + 流式回调）
-    const result = await callCursorCLI(prompt, mode, chatId, onStream);
+    // 调用 Cursor CLI（传入 threadKey 以支持 stop 命令 + 流式回调）
+    const result = await callCursorCLI(prompt, mode, threadKey, onStream);
     
     // 执行后获取文件快照
     const afterSnapshot = getFileSnapshot();
@@ -1120,14 +1177,14 @@ async function handleMessage(event) {
     if (newFiles.length > 0) {
       // 如果用户要求发送文件，自动发送新建的文件
       if (wantsSendFile) {
-        await sendMessage(chatId, `📤 正在发送 ${newFiles.length} 个新文件...`);
+        await sendMessage(chatId, `📤 正在发送 ${newFiles.length} 个新文件...`, 'text', replyToMessageId);
         
         let successCount = 0;
         let failedFiles = [];
         
         for (const file of newFiles.slice(0, 5)) { // 最多发送 5 个文件
           try {
-            await sendLocalFile(chatId, file.fullPath);
+            await sendLocalFile(chatId, file.fullPath, replyToMessageId);
             successCount++;
           } catch (error) {
             failedFiles.push({ name: file.path, error: error.message });
@@ -1142,9 +1199,9 @@ async function handleMessage(event) {
           if (failedFiles.length > 0) {
             notice += `\n\n❌ ${failedFiles.length} 个文件发送失败`;
           }
-          await sendMessage(chatId, notice);
+          await sendMessage(chatId, notice, 'text', replyToMessageId);
         } else if (failedFiles.length > 0) {
-          await sendMessage(chatId, `❌ 文件发送失败: ${failedFiles[0].error}`);
+          await sendMessage(chatId, `❌ 文件发送失败: ${failedFiles[0].error}`, 'text', replyToMessageId);
         }
       } else {
         // 不需要发送，只提示有新文件
@@ -1157,7 +1214,7 @@ async function handleMessage(event) {
         }
         fileNotice += '\n💡 发送 `/file <路径>` 获取文件';
         
-        await sendMarkdownCard(chatId, fileNotice, '📂 新文件');
+        await sendMarkdownCard(chatId, fileNotice, '📂 新文件', 'blue', replyToMessageId);
       }
     }
   } catch (error) {
@@ -1168,7 +1225,7 @@ async function handleMessage(event) {
       return;
     }
     
-    await sendMessage(chatId, `❌ 执行出错：${error.message}`);
+    await sendMessage(chatId, `❌ 执行出错：${error.message}`, 'text', replyToMessageId);
   }
 }
 
