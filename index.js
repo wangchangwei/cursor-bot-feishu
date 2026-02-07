@@ -9,7 +9,7 @@
 
 import { config as dotenvConfig } from 'dotenv';
 import * as lark from '@larksuiteoapi/node-sdk';
-import spawn from 'cross-spawn';
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -28,9 +28,6 @@ const config = {
   
   // Cursor CLI 工作目录（可选，默认当前目录）
   workDir: process.env.CURSOR_WORK_DIR || process.cwd(),
-  
-  // 命令超时时间（毫秒），默认 20 分钟
-  timeout: parseInt(process.env.CURSOR_TIMEOUT) || 1200000,
   
   // ripgrep 路径（可选，如果已在系统 PATH 中则无需配置）
   ripgrepPath: process.env.RIPGREP_PATH || '',
@@ -84,6 +81,14 @@ console.error = (...args) => {
   originalError(...args);
   writeLog('ERROR', ...args);
 };
+
+// ========== 全局异常捕获 ==========
+process.on('uncaughtException', (err) => {
+  console.error('[未捕获异常]', err.message, err.stack);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[未处理的 Promise 拒绝]', reason);
+});
 
 // ========== 消息去重缓存 ==========
 // 用于防止飞书消息重试导致的重复处理
@@ -202,9 +207,12 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null, onStream = n
   delete cleanEnv.CURSOR_AGENT;
   
   return new Promise((resolve, reject) => {
+    // 显式指定 shell：Windows 用 cmd.exe，避免 Node.js 回退到 /bin/sh
+    const shellOption = process.platform === 'win32' ? process.env.ComSpec || 'cmd.exe' : true;
     const child = spawn('agent', args, {
       cwd: config.workDir,
       env: cleanEnv,
+      shell: shellOption,
       stdio: ['pipe', 'pipe', 'pipe']
     });
     
@@ -355,14 +363,6 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null, onStream = n
     child.stdin.write(prompt);
     child.stdin.end();
     
-    // 超时处理
-    setTimeout(() => {
-      if (!child.killed) {
-        child.kill();
-        cleanupTask();
-        reject(new Error('命令执行超时（20分钟）'));
-      }
-    }, config.timeout);
   });
 }
 
@@ -922,9 +922,9 @@ async function handleMessage(event) {
     return;
   }
   
-  // 只处理文本消息
+  // 只处理文本消息，非文本消息（如系统通知、创建话题等）静默忽略
   if (msgType !== 'text') {
-    await sendMessage(chatId, '目前只支持文本消息哦~', 'text', replyToMessageId);
+    console.log(`[跳过] 非文本消息类型: ${msgType}, messageId: ${messageId}`);
     return;
   }
   
@@ -1028,8 +1028,7 @@ async function handleMessage(event) {
 ━━━━━━━━━━━━━━━━━━━━━━
 ⚙️ 当前配置
 ━━━━━━━━━━━━━━━━━━━━━━
-工作目录：${config.workDir}
-超时时间：${config.timeout / 1000} 秒`;
+工作目录：${config.workDir}`;
     
     await sendMessage(chatId, helpText, 'text', replyToMessageId);
     return;
@@ -1347,9 +1346,10 @@ async function startWebSocket() {
     eventDispatcher: new lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data) => {
         try {
+          console.log('[事件] 收到消息事件:', JSON.stringify(data?.message?.message_id));
           await handleMessage(data);
         } catch (error) {
-          console.error('[事件处理错误]', error);
+          console.error('[事件处理错误]', error.message, error.stack);
         }
       },
     }),
