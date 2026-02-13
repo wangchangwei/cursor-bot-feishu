@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cursor 飞书桥接 - 工作空间与会话管理</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+    h1 { margin-top: 0; color: #333; }
+    h2 { color: #555; font-size: 1.1rem; margin-bottom: 12px; }
+    section { background: #fff; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eee; }
+    th { background: #fafafa; font-weight: 600; color: #555; }
+    .path { font-family: ui-monospace, monospace; font-size: 0.9em; color: #666; word-break: break-all; }
+    .btn { padding: 6px 14px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    .btn-primary { background: #1a73e8; color: #fff; }
+    .btn-primary:hover { background: #1557b0; }
+    .btn-danger { background: #dc3545; color: #fff; }
+    .btn-danger:hover { background: #c82333; }
+    .form-row { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .form-row input { padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
+    .form-row input[type="text"] { flex: 1; min-width: 200px; }
+    .form-row input[type="number"] { width: 80px; }
+    .empty { color: #999; padding: 20px; text-align: center; }
+    .time { font-size: 0.9em; color: #666; }
+    .refresh { margin-bottom: 12px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; background: #e8f0fe; color: #1967d2; }
+  </style>
+</head>
+<body>
+  <h1>📂 Cursor 飞书桥接 - 管理</h1>
+  <p style="color:#666;">工作空间列表与 Agent 会话记录。在飞书发送「工作空间」查看列表，发送「工作空间 1」切换。</p>
+
+  <section>
+    <h2>工作空间列表</h2>
+    <div class="refresh">
+      <button class="btn btn-primary" onclick="loadWorkspaces()">刷新</button>
+    </div>
+    <div class="form-row">
+      <input type="text" id="wsName" placeholder="名称（如：项目A）" />
+      <input type="text" id="wsPath" placeholder="绝对路径（如：/Users/you/project）" />
+      <button class="btn btn-primary" onclick="addWorkspace()">添加工作空间</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th>序号</th><th>名称</th><th>路径</th><th>操作</th></tr>
+      </thead>
+      <tbody id="workspaceList"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Agent 会话记录（当前活跃）</h2>
+    <div class="refresh">
+      <button class="btn btn-primary" onclick="loadSessions()">刷新</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th>会话标识</th><th>工作空间</th><th>会话 ID</th><th>上次活跃</th></tr>
+      </thead>
+      <tbody id="sessionList"></tbody>
+    </table>
+  </section>
+
+  <script>
+    const base = window.location.origin;
+    function json(url, opts = {}) {
+      return fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts }).then(r => r.json());
+    }
+    function loadWorkspaces() {
+      json(base + '/api/workspaces').then(data => {
+        const tbody = document.getElementById('workspaceList');
+        if (!data.list || data.list.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="4" class="empty">暂无工作空间，请添加</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.list.map((w, i) => `
+          <tr>
+            <td>${i + 1}</td>
+            <td>${escapeHtml(w.name)}</td>
+            <td class="path">${escapeHtml(w.path)}</td>
+            <td><button class="btn btn-danger" onclick="delWorkspace('${escapeHtml(w.id)}')">删除</button></td>
+          </tr>
+        `).join('');
+      }).catch(e => { document.getElementById('workspaceList').innerHTML = '<tr><td colspan="4" class="empty">加载失败: ' + e.message + '</td></tr>'; });
+    }
+    function addWorkspace() {
+      const name = document.getElementById('wsName').value.trim() || '未命名';
+      const path = document.getElementById('wsPath').value.trim();
+      if (!path) { alert('请填写路径'); return; }
+      json(base + '/api/workspaces', { method: 'POST', body: JSON.stringify({ name, path }) })
+        .then(data => { if (data.success) { document.getElementById('wsPath').value = ''; document.getElementById('wsName').value = ''; loadWorkspaces(); } else alert(data.error || '添加失败'); })
+        .catch(e => alert('请求失败: ' + e.message));
+    }
+    function delWorkspace(id) {
+      if (!confirm('确定删除该工作空间？')) return;
+      json(base + '/api/workspaces/' + encodeURIComponent(id), { method: 'DELETE' })
+        .then(data => { if (data.success) loadWorkspaces(); });
+    }
+    function loadSessions() {
+      json(base + '/api/sessions').then(data => {
+        const tbody = document.getElementById('sessionList');
+        if (!data.sessions || data.sessions.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="4" class="empty">暂无活跃会话</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.sessions.map(s => `
+          <tr>
+            <td><span class="badge">${escapeHtml(s.threadKey)}</span></td>
+            <td>${escapeHtml(s.workspace)}</td>
+            <td class="path">${escapeHtml(s.conversationId || '-')}</td>
+            <td class="time">${formatTime(s.lastActiveTime)}</td>
+          </tr>
+        `).join('');
+      }).catch(e => { document.getElementById('sessionList').innerHTML = '<tr><td colspan="4" class="empty">加载失败: ' + e.message + '</td></tr>'; });
+    }
+    function escapeHtml(s) {
+      const div = document.createElement('div');
+      div.textContent = s;
+      return div.innerHTML;
+    }
+    function formatTime(ms) {
+      if (!ms) return '-';
+      const d = new Date(ms);
+      const now = Date.now();
+      const diff = now - ms;
+      if (diff < 60000) return d.toLocaleTimeString('zh-CN') + '（刚刚）';
+      if (diff < 3600000) return d.toLocaleTimeString('zh-CN') + '（' + Math.floor(diff/60000) + ' 分钟前）';
+      return d.toLocaleString('zh-CN');
+    }
+    loadWorkspaces();
+    loadSessions();
+  </script>
+</body>
+</html>

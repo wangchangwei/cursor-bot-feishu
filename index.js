@@ -156,6 +156,87 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000); // 每 5 分钟检查一次
 
+// ========== 工作空间管理 ==========
+const WORKSPACES_FILE = path.join(__dirname, 'workspaces.json');
+// 当前会话选择的工作空间：threadKey -> 绝对路径
+const chatWorkspace = new Map();
+
+function loadWorkspaces() {
+  try {
+    if (fs.existsSync(WORKSPACES_FILE)) {
+      const data = JSON.parse(fs.readFileSync(WORKSPACES_FILE, 'utf8'));
+      return Array.isArray(data.list) ? data : { list: [], defaultId: null };
+    }
+  } catch (e) {
+    console.error('[工作空间] 读取配置失败:', e.message);
+  }
+  const defaultPath = path.resolve(config.workDir);
+  return {
+    list: [{ id: 'default', name: '默认', path: defaultPath }],
+    defaultId: 'default',
+  };
+}
+
+function saveWorkspaces(data) {
+  fs.writeFileSync(WORKSPACES_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function getWorkspacesData() {
+  const data = loadWorkspaces();
+  if (!data.list || data.list.length === 0) {
+    data.list = [{ id: 'default', name: '默认', path: path.resolve(config.workDir) }];
+    data.defaultId = 'default';
+    saveWorkspaces(data);
+  }
+  return data;
+}
+
+function getWorkspaceList() {
+  return getWorkspacesData().list;
+}
+
+function getDefaultWorkspacePath() {
+  const data = getWorkspacesData();
+  const def = data.list.find((w) => w.id === data.defaultId);
+  return def ? path.resolve(def.path) : path.resolve(config.workDir);
+}
+
+/** 获取某会话使用的工作目录（绝对路径） */
+function getWorkDir(threadKey) {
+  const p = chatWorkspace.get(threadKey);
+  if (p) return p;
+  return getDefaultWorkspacePath();
+}
+
+function setChatWorkspace(threadKey, workspacePath) {
+  const abs = path.resolve(workspacePath);
+  chatWorkspace.set(threadKey, abs);
+  console.log(`[工作空间] 会话 ${threadKey} 使用: ${abs}`);
+}
+
+function clearChatWorkspace(threadKey) {
+  chatWorkspace.delete(threadKey);
+}
+
+function addWorkspace(name, dirPath) {
+  const data = getWorkspacesData();
+  const id = 'ws_' + Date.now();
+  const abs = path.resolve(dirPath);
+  data.list.push({ id, name: name || id, path: abs });
+  if (!data.defaultId) data.defaultId = id;
+  saveWorkspaces(data);
+  return id;
+}
+
+function removeWorkspace(id) {
+  const data = getWorkspacesData();
+  const before = data.list.length;
+  data.list = data.list.filter((w) => w.id !== id);
+  if (data.defaultId === id) data.defaultId = data.list[0]?.id || null;
+  if (data.list.length < before) saveWorkspaces(data);
+  return data.list.length < before;
+}
+
 function isMessageProcessed(messageId) {
   if (processedMessages.has(messageId)) {
     console.log(`[去重] 消息已处理过，跳过: ${messageId}`);
@@ -180,16 +261,22 @@ const client = new lark.Client({
 
 // ========== 调用 Cursor CLI（支持流式回调） ==========
 async function callCursorCLI(prompt, mode = 'agent', chatId = null, onStream = null) {
+  const workDir = chatId ? getWorkDir(chatId) : path.resolve(config.workDir);
   console.log(`[Cursor CLI] 执行任务: ${prompt.substring(0, 50)}...`);
   console.log(`[Cursor CLI] 模式: ${mode}`);
-  console.log(`[Cursor CLI] 工作目录: ${config.workDir}`);
+  console.log(`[Cursor CLI] 工作目录: ${workDir}`);
   
   // 获取现有会话（如果有）
   const existingSession = chatId ? getSession(chatId) : null;
   const conversationId = existingSession?.conversationId;
   
-  // 构建命令参数
-  const args = ['-p', '--force', '--output-format', 'stream-json', '--stream-partial-output', '--approve-mcps'];
+  // 构建命令参数（--workspace 确保 agent 的文档/上下文使用指定目录）
+  const workspacePath = path.resolve(workDir);
+  const args = [
+    '-p', '--force',
+    '--workspace', workspacePath,
+    '--output-format', 'stream-json', '--stream-partial-output', '--approve-mcps'
+  ];
   
   // 如果有现有会话，使用 --resume 参数继续对话
   if (conversationId) {
@@ -210,7 +297,7 @@ async function callCursorCLI(prompt, mode = 'agent', chatId = null, onStream = n
     // 显式指定 shell：Windows 用 cmd.exe，避免 Node.js 回退到 /bin/sh
     const shellOption = process.platform === 'win32' ? process.env.ComSpec || 'cmd.exe' : true;
     const child = spawn('agent', args, {
-      cwd: config.workDir,
+      cwd: workDir,
       env: cleanEnv,
       shell: shellOption,
       stdio: ['pipe', 'pipe', 'pipe']
@@ -661,12 +748,12 @@ async function sendFile(chatId, fileKey, fileName, replyToMessageId = null) {
 }
 
 // ========== 发送本地文件到飞书 ==========
-async function sendLocalFile(chatId, filePath, replyToMessageId = null) {
+async function sendLocalFile(chatId, filePath, replyToMessageId = null, workDir = null) {
   try {
-    // 处理相对路径
+    const baseDir = workDir || config.workDir;
     let absolutePath = filePath;
     if (!path.isAbsolute(filePath)) {
-      absolutePath = path.join(config.workDir, filePath);
+      absolutePath = path.join(baseDir, filePath);
     }
     
     console.log(`[文件] 准备发送文件: ${absolutePath}`);
@@ -716,7 +803,7 @@ function listFiles(dirPath = config.workDir, pattern = '') {
       }
       
       const fullPath = path.join(dirPath, item.name);
-      const relativePath = path.relative(config.workDir, fullPath);
+      const relativePath = path.relative(dirPath, fullPath);
       
       if (item.isFile()) {
         // 如果有 pattern，检查文件名是否匹配
@@ -1095,6 +1182,57 @@ async function handleMessage(event) {
     return;
   }
   
+  // 工作空间列表（仅当未带序号或名称时展示列表）
+  const showWorkspaceList = text === '工作空间' || text === '工作空间列表' || text.startsWith('工作空间列表') ||
+    (text.trim() === '/workspace' || (text.startsWith('/workspace') && !text.match(/^\/workspace\s+\S+/)));
+  if (showWorkspaceList) {
+    const list = getWorkspaceList();
+    const currentPath = getWorkDir(threadKey);
+    const currentName = list.find((w) => path.resolve(w.path) === currentPath)?.name || '默认';
+    let msg = `📂 工作空间列表（当前: ${currentName}）\n\n`;
+    list.forEach((w, i) => {
+      const isCurrent = path.resolve(w.path) === currentPath ? ' ✓' : '';
+      msg += `${i + 1}. ${w.name}${isCurrent}\n   ${w.path}\n\n`;
+    });
+    msg += '切换工作空间：发送「工作空间 1」或「/workspace 1」使用序号，或「工作空间 默认」恢复默认';
+    await sendMessage(chatId, msg, 'text', replyToMessageId);
+    return;
+  }
+  
+  // 切换工作空间：/workspace 1 或 工作空间 1 或 工作空间 项目名
+  if (text.match(/^\/workspace\s+(\d+)/) || text.match(/^工作空间\s+(\d+)/) ||
+      text.match(/^\/workspace\s+(.+)/) || text.match(/^工作空间\s+(.+)/)) {
+    const match = text.match(/(?:^\/workspace\s+|^工作空间\s+)(\d+|\S+)/);
+    const arg = match ? match[1].trim() : '';
+    const list = getWorkspaceList();
+    if (/^\d+$/.test(arg)) {
+      const idx = parseInt(arg, 10);
+      if (idx < 1 || idx > list.length) {
+        await sendMessage(chatId, `请输入 1～${list.length} 之间的序号`, 'text', replyToMessageId);
+        return;
+      }
+      const w = list[idx - 1];
+      setChatWorkspace(threadKey, w.path);
+      await sendMessage(chatId, `✅ 已切换工作空间为：${w.name}\n${w.path}`, 'text', replyToMessageId);
+      return;
+    }
+    if (arg === '默认' || arg === 'default') {
+      clearChatWorkspace(threadKey);
+      const defPath = getDefaultWorkspacePath();
+      const defName = list.find((w) => path.resolve(w.path) === defPath)?.name || '默认';
+      await sendMessage(chatId, `✅ 已恢复默认工作空间：${defName}\n${defPath}`, 'text', replyToMessageId);
+      return;
+    }
+    const byName = list.find((w) => w.name === arg || w.id === arg);
+    if (byName) {
+      setChatWorkspace(threadKey, byName.path);
+      await sendMessage(chatId, `✅ 已切换工作空间为：${byName.name}\n${byName.path}`, 'text', replyToMessageId);
+      return;
+    }
+    await sendMessage(chatId, '未找到该工作空间，请发送「工作空间」查看列表', 'text', replyToMessageId);
+    return;
+  }
+  
   // Help 命令 - 帮助信息
   if (text.includes('/help') || text === '帮助') {
     const helpText = `🤖 Cursor AI 助手使用说明
@@ -1116,6 +1254,14 @@ async function handleMessage(event) {
 ━━━━━━━━━━━━━━━━━━━━━━
 /plan 你的任务
 或：规划：你的任务
+
+━━━━━━━━━━━━━━━━━━━━━━
+📂 工作空间
+━━━━━━━━━━━━━━━━━━━━━━
+/workspace 或 工作空间 - 查看工作空间列表
+/workspace 1 或 工作空间 1 - 切换到第 1 个工作空间
+工作空间 默认 - 恢复默认工作空间
+Agent 将在当前选择的工作目录下执行
 
 ━━━━━━━━━━━━━━━━━━━━━━
 💬 会话管理
@@ -1203,7 +1349,7 @@ async function handleMessage(event) {
     await sendMessage(chatId, `📤 正在发送文件: ${filePath}`, 'text', replyToMessageId);
     
     try {
-      const result = await sendLocalFile(chatId, filePath, replyToMessageId);
+      const result = await sendLocalFile(chatId, filePath, replyToMessageId, getWorkDir(threadKey));
       await sendMessage(chatId, `✅ 文件发送成功\n\n文件名: ${result.fileName}\n大小: ${formatFileSize(result.fileSize)}`, 'text', replyToMessageId);
     } catch (error) {
       await sendMessage(chatId, `❌ 文件发送失败: ${error.message}`, 'text', replyToMessageId);
@@ -1213,11 +1359,10 @@ async function handleMessage(event) {
   
   // Ls 命令 - 列出文件
   if (text.startsWith('/ls') || text === '文件列表' || text === '列出文件') {
-    // 解析搜索参数
     const match = text.match(/^\/ls\s+(.+)/);
     const pattern = match ? match[1].trim() : '';
-    
-    const files = listFiles(config.workDir, pattern);
+    const workDir = getWorkDir(threadKey);
+    const files = listFiles(workDir, pattern);
     
     if (files.length === 0) {
       await sendMessage(chatId, pattern 
@@ -1307,7 +1452,7 @@ function startApiServer() {
   const server = http.createServer(async (req, res) => {
     // 设置 CORS 头
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     
     // 处理 OPTIONS 预检请求
@@ -1343,9 +1488,8 @@ function startApiServer() {
           }
           
           console.log(`[API] 收到文件发送请求: ${filePath} -> ${currentActiveChatId}`);
-          
-          // 发送文件
-          const result = await sendLocalFile(currentActiveChatId, filePath);
+          const workDir = getWorkDir(currentActiveChatId);
+          const result = await sendLocalFile(currentActiveChatId, filePath, null, workDir);
           
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ 
@@ -1372,6 +1516,74 @@ function startApiServer() {
         workDir: config.workDir,
       }));
     }
+    // GET /api/workspaces - 工作空间列表
+    else if (req.method === 'GET' && req.url === '/api/workspaces') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, list: getWorkspaceList() }));
+    }
+    // POST /api/workspaces - 新增工作空间
+    else if (req.method === 'POST' && req.url === '/api/workspaces') {
+      let body = '';
+      req.on('data', (c) => { body += c.toString(); });
+      req.on('end', () => {
+        try {
+          const data = JSON.parse(body || '{}');
+          const name = data.name || '未命名';
+          const dirPath = data.path;
+          if (!dirPath) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: '缺少 path' }));
+            return;
+          }
+          const id = addWorkspace(name, dirPath);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, id, list: getWorkspaceList() }));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+      });
+    }
+    // DELETE /api/workspaces/:id - 删除工作空间
+    else if (req.method === 'DELETE' && req.url.startsWith('/api/workspaces/')) {
+      const id = decodeURIComponent(req.url.slice('/api/workspaces/'.length));
+      const ok = removeWorkspace(id);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, removed: ok, list: getWorkspaceList() }));
+    }
+    // GET /api/sessions - Agent 会话记录（当前活跃会话）
+    else if (req.method === 'GET' && req.url === '/api/sessions') {
+      const defaultPath = getDefaultWorkspacePath();
+      const sessions = [];
+      for (const [threadKey, session] of chatSessions.entries()) {
+        if (Date.now() - session.lastActiveTime > SESSION_TTL) continue;
+        const workspacePath = chatWorkspace.get(threadKey) || defaultPath;
+        const list = getWorkspaceList();
+        const wsName = list.find((w) => path.resolve(w.path) === workspacePath)?.name || path.basename(workspacePath);
+        sessions.push({
+          threadKey,
+          conversationId: session.conversationId?.substring(0, 24) + '...',
+          lastActiveTime: session.lastActiveTime,
+          workspace: wsName,
+          workspacePath,
+        });
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, sessions }));
+    }
+    // GET /manage - 管理页面
+    else if (req.method === 'GET' && (req.url === '/manage' || req.url === '/manage/' || req.url === '/')) {
+      const htmlPath = path.join(__dirname, 'manage.html');
+      if (!fs.existsSync(htmlPath)) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('manage.html not found');
+        return;
+      }
+      const html = fs.readFileSync(htmlPath, 'utf8');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.writeHead(200);
+      res.end(html);
+    }
     // 其他请求返回 404
     else {
       res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -1381,8 +1593,12 @@ function startApiServer() {
   
   server.listen(config.apiPort, '127.0.0.1', () => {
     console.log(`📡 API 服务已启动: http://localhost:${config.apiPort}`);
+    console.log(`   - GET  /manage - 工作空间与会话管理页面`);
+    console.log(`   - GET  /api/workspaces - 工作空间列表`);
+    console.log(`   - POST /api/workspaces - 新增工作空间`);
+    console.log(`   - GET  /api/sessions - Agent 会话记录`);
     console.log(`   - POST /send-file - 发送文件到飞书`);
-    console.log(`   - GET /health - 健康检查`);
+    console.log(`   - GET  /health - 健康检查`);
   });
   
   server.on('error', (err) => {
