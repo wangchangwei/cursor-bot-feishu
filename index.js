@@ -51,6 +51,10 @@ if (config.ripgrepPath) {
 // 用于过滤历史消息，只处理服务启动后的消息
 const SERVICE_START_TIME = Date.now();
 
+// ========== 机器人自身信息 ==========
+// 用于群聊中判断是否 @ 了机器人（而不是 @ 了其他人）
+let botOpenId = null;
+
 // ========== 日志文件配置 ==========
 const LOG_FILE = path.join(config.workDir, 'cursor-bridge.log');
 
@@ -177,6 +181,41 @@ const client = new lark.Client({
   appSecret: config.appSecret,
   disableTokenCache: false,
 });
+
+// ========== 获取机器人自身信息 ==========
+async function fetchBotInfo() {
+  try {
+    // 先获取 tenant_access_token
+    const tokenResp = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: config.appId, app_secret: config.appSecret }),
+    });
+    const tokenData = await tokenResp.json();
+    const token = tokenData.tenant_access_token;
+    
+    if (!token) {
+      console.error('[机器人] 获取 token 失败:', JSON.stringify(tokenData));
+      return;
+    }
+    
+    // 调用 bot info API
+    const resp = await fetch('https://open.feishu.cn/open-apis/bot/v3/info/', {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    const data = await resp.json();
+    
+    const openId = data?.bot?.open_id;
+    if (openId) {
+      botOpenId = openId;
+      console.log(`[机器人] 获取到 open_id: ${botOpenId}`);
+    } else {
+      console.error('[机器人] 未能获取 open_id，响应:', JSON.stringify(data).substring(0, 500));
+    }
+  } catch (error) {
+    console.error('[机器人] 获取机器人信息失败:', error.message);
+  }
+}
 
 // ========== 调用 Cursor CLI（支持流式回调） ==========
 async function callCursorCLI(prompt, mode = 'agent', chatId = null, onStream = null) {
@@ -409,6 +448,80 @@ function stopTask(chatId) {
     return { stopped: true, prompt: task.prompt, duration };
   }
   return { stopped: false };
+}
+
+// ========== 从富文本(post)消息中提取纯文本 ==========
+function extractTextFromPost(content) {
+  try {
+    // 飞书 post 消息结构：
+    // { "title": "可选标题", "content": [[{tag:"text", text:"..."}, {tag:"at", user_name:"xxx"}, ...], [...]] }
+    // 可能嵌套在语言 key 下：{ "zh_cn": { "title": ..., "content": ... } }
+    let postBody = content;
+    
+    // 处理多语言包装：{ zh_cn: { title, content } } 或 { en_us: { title, content } }
+    if (!postBody.content && !postBody.title) {
+      // 尝试获取第一个语言版本
+      const langKeys = ['zh_cn', 'en_us', 'ja_jp'];
+      for (const key of langKeys) {
+        if (postBody[key]) {
+          postBody = postBody[key];
+          break;
+        }
+      }
+      // 如果仍然没有，取第一个可用的 key
+      if (!postBody.content) {
+        const firstKey = Object.keys(content).find(k => content[k]?.content);
+        if (firstKey) {
+          postBody = content[firstKey];
+        }
+      }
+    }
+    
+    const parts = [];
+    
+    // 添加标题
+    if (postBody.title) {
+      parts.push(postBody.title);
+    }
+    
+    // 遍历内容段落
+    if (Array.isArray(postBody.content)) {
+      for (const paragraph of postBody.content) {
+        if (!Array.isArray(paragraph)) continue;
+        
+        const lineTexts = [];
+        for (const element of paragraph) {
+          if (element.tag === 'text' && element.text) {
+            lineTexts.push(element.text);
+          } else if (element.tag === 'a' && element.text) {
+            // 超链接：保留文本
+            lineTexts.push(element.text);
+          } else if (element.tag === 'at') {
+            // @提及：用 @用户名 表示
+            if (element.user_name) {
+              lineTexts.push(`@${element.user_name}`);
+            }
+          } else if (element.tag === 'code') {
+            // 行内代码
+            lineTexts.push(element.text || '');
+          } else if (element.tag === 'code_block') {
+            // 代码块
+            lineTexts.push(element.text || '');
+          }
+        }
+        
+        if (lineTexts.length > 0) {
+          parts.push(lineTexts.join(''));
+        }
+      }
+    }
+    
+    return parts.join('\n').trim();
+  } catch (error) {
+    console.error('[Post解析] 富文本解析失败:', error.message, JSON.stringify(content).substring(0, 500));
+    // 兜底：尝试直接 JSON 序列化
+    return JSON.stringify(content);
+  }
 }
 
 // ========== 解析用户消息 ==========
@@ -1038,15 +1151,39 @@ async function handleMessage(event) {
     return;
   }
   
-  // 只处理文本消息，非文本消息（如系统通知、创建话题等）静默忽略
-  if (msgType !== 'text') {
-    console.log(`[跳过] 非文本消息类型: ${msgType}, messageId: ${messageId}`);
+  // 只处理文本和富文本消息，其他类型（图片、文件、系统通知等）静默忽略
+  if (msgType !== 'text' && msgType !== 'post') {
+    console.log(`[跳过] 不支持的消息类型: ${msgType}, messageId: ${messageId}`);
     return;
+  }
+  
+  // 群聊中必须 @ 机器人才响应，私聊则直接响应
+  const chatType = message.chat_type;
+  if (chatType === 'group') {
+    const mentions = message.mentions;
+    // 检查是否明确 @ 了机器人（而不是 @ 了其他人）
+    const isBotMentioned = mentions && mentions.some(m => {
+      const mentionId = m?.id?.open_id || m?.id?.union_id || m?.id;
+      return mentionId === botOpenId;
+    });
+    if (!isBotMentioned) {
+      console.log(`[跳过] 群聊消息未 @ 机器人，忽略: ${messageId} (mentions: ${JSON.stringify(mentions?.map(m => m?.name || m?.id))})`);
+      return;
+    }
   }
   
   // 解析消息内容
   const content = JSON.parse(message.content);
-  const text = content.text || '';
+  let text = '';
+  
+  if (msgType === 'text') {
+    // 纯文本消息
+    text = content.text || '';
+  } else if (msgType === 'post') {
+    // 富文本消息：提取所有文本内容
+    text = extractTextFromPost(content);
+    console.log(`[Post] 从富文本提取的文本: ${text.substring(0, 200)}...`);
+  }
   
   console.log(`[收到消息] ${text} (ID: ${messageId}, threadKey: ${threadKey})`);
   
@@ -1406,6 +1543,9 @@ async function startWebSocket() {
   console.log(`启动时间: ${new Date(SERVICE_START_TIME).toLocaleString()}`);
   console.log(`历史消息: 将被自动过滤`);
   console.log('');
+  
+  // 获取机器人自身信息（用于群聊 @ 判断）
+  await fetchBotInfo();
   
   // 创建 WebSocket 客户端
   const wsClient = new lark.WSClient({
